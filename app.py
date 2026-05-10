@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 import numpy as np
@@ -7,6 +8,8 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+
+from pricing import build_cashflows, duration_convexity_from_ytm
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -312,6 +315,10 @@ def weighted_average(df: pd.DataFrame, column: str) -> float:
     return float((df["weight_share"] * df[column]).sum())
 
 
+def weighted_nav_from_series(df: pd.DataFrame, price_series: pd.Series) -> float:
+    return float((df["weight_share"] * price_series).sum())
+
+
 def get_default_last_trade(etf_code: str, inav_proxy: float) -> float:
     return round(inav_proxy * (1.0 + ETF_DEFAULT_PD_BP[etf_code] / 10000.0), 2)
 
@@ -322,6 +329,86 @@ def dv01_per_10mm_from_per_100(dv01_per_100: float) -> float:
 
 def compute_cdx_ig_hedge_notional(dv01_per_10mm: float) -> float:
     return round((dv01_per_10mm / CDX_IG_DV01_PER_BP_USD) * DEFAULT_PORTFOLIO_NOTIONAL_USD)
+
+
+def apply_cashflow_risk_overrides(df: pd.DataFrame, settlement_date: pd.Timestamp) -> pd.DataFrame:
+    overridden_df = df.copy()
+    durations: list[float] = []
+    convexities: list[float] = []
+    for row in overridden_df.itertuples(index=False):
+        cashflows = build_cashflows(
+            coupon_pct=float(row.coupon),
+            maturity_date=row.maturity,
+            settlement_date=settlement_date,
+        )
+        duration, convexity = duration_convexity_from_ytm(
+            cashflows=cashflows,
+            ytm_pct=float(row.yield_pct),
+            settlement_date=settlement_date,
+        )
+        durations.append(duration)
+        convexities.append(convexity)
+    overridden_df["duration"] = durations
+    overridden_df["convexity"] = convexities
+    return overridden_df
+
+
+def stable_seed_from_cusip(cusip: str) -> int:
+    return int(hashlib.sha256(cusip.encode("utf-8")).hexdigest()[:8], 16)
+
+
+def build_pricing_waterfall(df: pd.DataFrame, staleness_seconds: int) -> tuple[pd.DataFrame, dict]:
+    pricing_df = df.copy()
+    evaluated_offsets = []
+    for row in pricing_df.itertuples(index=False):
+        rng = np.random.default_rng(stable_seed_from_cusip(row.cusip))
+        evaluated_offsets.append(rng.normal(0.0, row.bid_ask_bps / 100.0 / 4.0))
+
+    pricing_df["last_trade_price"] = pricing_df["clean_price"]
+    pricing_df["evaluated_price"] = pricing_df["clean_price"] + evaluated_offsets
+    pricing_df["chosen_price"] = np.where(
+        staleness_seconds < 30,
+        pricing_df["last_trade_price"],
+        pricing_df["evaluated_price"],
+    )
+
+    nav_last_trade = weighted_nav_from_series(pricing_df, pricing_df["last_trade_price"])
+    nav_evaluated = weighted_nav_from_series(pricing_df, pricing_df["evaluated_price"])
+    nav_chosen = weighted_nav_from_series(pricing_df, pricing_df["chosen_price"])
+    return pricing_df, {
+        "nav_last_trade": nav_last_trade,
+        "nav_evaluated": nav_evaluated,
+        "nav_chosen": nav_chosen,
+        "nav_last_trade_bp": 0.0,
+        "nav_evaluated_bp": (nav_evaluated / nav_last_trade - 1.0) * 10000.0,
+        "nav_chosen_bp": (nav_chosen / nav_last_trade - 1.0) * 10000.0,
+    }
+
+
+def compute_ap_economics(
+    df: pd.DataFrame,
+    inav_proxy: float,
+    last_trade: float,
+    financing_bp: float,
+    cross_bp: float,
+) -> dict:
+    half_spread_adjustment = (df["bid_ask_bps"] / 2.0 / 100.0) * (df["clean_price"] / 100.0)
+    basket_bid_nav = weighted_nav_from_series(df, df["clean_price"] - half_spread_adjustment)
+    basket_offer_nav = weighted_nav_from_series(df, df["clean_price"] + half_spread_adjustment)
+    create_cost_bp = (basket_offer_nav / inav_proxy - 1.0) * 10000.0 + financing_bp + cross_bp
+    redeem_cost_bp = (1.0 - basket_bid_nav / inav_proxy) * 10000.0 + financing_bp + cross_bp
+    etf_premium_bp = (last_trade - inav_proxy) / inav_proxy * 10000.0
+    create_arb_bp = etf_premium_bp - create_cost_bp
+    redeem_arb_bp = -etf_premium_bp - redeem_cost_bp
+    return {
+        "basket_bid_nav": basket_bid_nav,
+        "basket_offer_nav": basket_offer_nav,
+        "create_cost_bp": create_cost_bp,
+        "redeem_cost_bp": redeem_cost_bp,
+        "etf_premium_bp": etf_premium_bp,
+        "create_arb_bp": create_arb_bp,
+        "redeem_arb_bp": redeem_arb_bp,
+    }
 
 
 def compute_bond_shocked_price(row: pd.Series, effective_shock_bp: float) -> float:
@@ -441,14 +528,54 @@ def format_interpretation(
     metrics: dict,
     bucket_df: pd.DataFrame,
 ) -> list[str]:
-    direction = "rich" if metrics["premium_discount_bp"] > 0 else "cheap"
+    bullets: list[str] = []
+    abs_pd_bp = abs(metrics["premium_discount_bp"])
+    weighted_bid_ask = metrics["weighted_bid_ask_bps"]
+    rich_or_cheap = "rich" if metrics["premium_discount_bp"] > 0 else "cheap"
     dominant_bucket = bucket_df.sort_values("weight_pct", ascending=False).iloc[0]
-    return [
-        f"Last trade is {abs(metrics['premium_discount_bp']):.1f} bp {direction} to the basket iNAV proxy at {metrics['inav_proxy']:.2f}.",
-        f"Portfolio DV01 is ${metrics['dv01_per_100']:.3f} per $100, which scales to roughly ${metrics['dv01_per_10mm']:,.0f} per bp on a $10mm line item.",
-        f"The basket is concentrated in the {dominant_bucket['bucket']} bucket ({dominant_bucket['weight_pct']:.1f}%) with top-5 weight at {metrics['top_5_concentration']:.1f}%.",
-        f"Current marks are {int(metrics['staleness_seconds'])} seconds old and the weighted bond bid/ask is {metrics['weighted_bid_ask_bps']:.2f} bp.",
-    ]
+
+    if abs_pd_bp < 5 and weighted_bid_ask < 5:
+        bullets.append("Basket trades within market frictions; no AP edge available.")
+    elif abs_pd_bp > 30 and weighted_bid_ask < 10:
+        bullets.append(
+            f"Persistent {rich_or_cheap} dislocation in a tight basket; check inventory and recency before sizing."
+        )
+    elif abs_pd_bp > 50 and weighted_bid_ask > 20:
+        bullets.append("Wide P/D in an illiquid basket; likely stale marks, do not act without iNAV refresh.")
+    else:
+        bullets.append(
+            f"Moderate {rich_or_cheap} basis versus the basket proxy; tradeability depends more on basket liquidity than on headline P/D alone."
+        )
+
+    if metrics["create_arb_bp"] > 0:
+        bullets.append(
+            f"Create-side economics are positive at {metrics['create_arb_bp']:+.1f} bp after financing and crossing costs."
+        )
+    elif metrics["redeem_arb_bp"] > 0:
+        bullets.append(
+            f"Redeem-side economics are positive at {metrics['redeem_arb_bp']:+.1f} bp after financing and crossing costs."
+        )
+    else:
+        bullets.append("Neither create nor redeem clears estimated costs at current marks.")
+
+    if metrics["curve_scenario"] != "None":
+        if dominant_bucket["bucket"] in {"7-10y", "10y+"}:
+            bullets.append(
+                f"{metrics['curve_scenario']} scenario risk is driven by the long end because {dominant_bucket['bucket']} bonds carry {dominant_bucket['weight_pct']:.1f}% of the basket."
+            )
+        else:
+            bullets.append(
+                f"{metrics['curve_scenario']} scenario risk is concentrated in the intermediate bucket, so front-to-belly curve moves dominate P&L."
+            )
+    else:
+        bullets.append(
+            f"Basket concentration is moderate: top five holdings are {metrics['top_5_concentration']:.1f}% and the dominant bucket is {dominant_bucket['bucket']}."
+        )
+
+    bullets.append(
+        f"Rates hedge with {metrics['ty_hedge_contracts']} TY contracts neutralises parallel rate DV01; residual exposure is curve and basis."
+    )
+    return bullets[:4]
 
 
 def plot_bucket_exposure(bucket_df: pd.DataFrame) -> go.Figure:
@@ -589,6 +716,49 @@ def style_holdings_table(df: pd.DataFrame) -> pd.DataFrame:
     ]
 
 
+def style_pricing_detail_table(df: pd.DataFrame) -> pd.DataFrame:
+    display = df.copy()
+    price_columns = [
+        "weight_pct",
+        "clean_price",
+        "last_trade_price",
+        "evaluated_price",
+        "chosen_price",
+        "bid_ask_bps",
+    ]
+    for column in price_columns:
+        display[column] = display[column].astype(float).round(3 if "price" in column else 2)
+    return display[
+        [
+            "cusip",
+            "description",
+            "weight_pct",
+            "clean_price",
+            "last_trade_price",
+            "evaluated_price",
+            "chosen_price",
+            "bid_ask_bps",
+        ]
+    ]
+
+
+def render_signal_tile(label: str, value: float) -> None:
+    signal_class = "signal-neutral"
+    if value > 0:
+        signal_class = "signal-positive"
+    elif value < -10:
+        signal_class = "signal-negative"
+    st.markdown(
+        f"""
+        <div class="signal-card {signal_class}">
+            <div class="signal-card__label">{label}</div>
+            <div class="signal-card__value">{value:+.1f} bp</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def main() -> None:
     st.set_page_config(
         page_title="Fixed Income ETF Fair Value & Basket Analytics",
@@ -603,6 +773,9 @@ def main() -> None:
 
     selected_etf_label = st.sidebar.radio("ETF", options=list(ETF_LABEL_MAP.keys()), index=0)
     selected_etf_code = ETF_LABEL_MAP[selected_etf_label]
+    if st.session_state.get("_cashflow_seed") != selected_etf_code:
+        st.session_state.compute_duration_from_cashflows = selected_etf_code == "IEF"
+        st.session_state._cashflow_seed = selected_etf_code
     st.sidebar.markdown("### Controls")
     st.sidebar.caption(
         "Upload a custom CSV or use the bundled realistic illustrative basket. Required columns: "
@@ -612,6 +785,14 @@ def main() -> None:
     uploaded_file = st.sidebar.file_uploader("Upload custom holdings CSV", type=["csv"])
 
     holdings_df, data_source_label, load_messages = load_holdings(uploaded_file, selected_etf_code)
+    compute_duration_from_cashflows = st.sidebar.toggle(
+        "Compute duration from cashflows",
+        key="compute_duration_from_cashflows",
+    )
+    settlement_date = pd.Timestamp.today().normalize()
+    if compute_duration_from_cashflows:
+        holdings_df = apply_cashflow_risk_overrides(holdings_df, settlement_date)
+
     inav_proxy = weighted_average(holdings_df, "clean_price")
 
     data_seed = f"{selected_etf_code}:{data_source_label}:{len(holdings_df)}:{round(inav_proxy, 4)}"
@@ -654,6 +835,23 @@ def main() -> None:
         options=list(CURVE_TWISTS.keys()),
         index=0,
     )
+    st.sidebar.markdown("### AP assumptions")
+    financing_bp = st.sidebar.number_input(
+        "Financing (bp)",
+        min_value=0.0,
+        value=5.0,
+        step=0.5,
+        format="%.1f",
+        key="financing_bp",
+    )
+    cross_bp = st.sidebar.number_input(
+        "Crossing / fees (bp)",
+        min_value=0.0,
+        value=1.0,
+        step=0.5,
+        format="%.1f",
+        key="cross_bp",
+    )
 
     weighted_duration = weighted_average(holdings_df, "duration")
     weighted_convexity = weighted_average(holdings_df, "convexity")
@@ -666,6 +864,14 @@ def main() -> None:
     cdx_ig_hedge_notional = compute_cdx_ig_hedge_notional(dv01_per_10mm) if selected_etf_code == "LQD" else None
     premium_discount_pct = (market_price - inav_proxy) / inav_proxy * 100.0
     premium_discount_bp = premium_discount_pct * 100.0
+    pricing_detail_df, pricing_waterfall_metrics = build_pricing_waterfall(holdings_df, int(staleness_seconds))
+    ap_economics = compute_ap_economics(
+        holdings_df,
+        inav_proxy=inav_proxy,
+        last_trade=market_price,
+        financing_bp=financing_bp,
+        cross_bp=cross_bp,
+    )
 
     current_shocked_gross_value, shocked_prices = compute_portfolio_value(
         holdings_df,
@@ -692,9 +898,14 @@ def main() -> None:
         "weighted_bid_ask_bps": weighted_bid_ask_bps,
         "weighted_liquidity_score": weighted_liquidity_score,
         "current_shocked_nav": current_shocked_nav,
+        "curve_scenario": curve_scenario,
+        "create_arb_bp": ap_economics["create_arb_bp"],
+        "redeem_arb_bp": ap_economics["redeem_arb_bp"],
     }
 
     make_metric_cards(metrics=metrics, etf_code=selected_etf_code)
+    if compute_duration_from_cashflows:
+        st.caption("Duration computed from cashflows.")
 
     st.markdown("---")
     st.subheader("Basket diagnostics")
@@ -739,6 +950,43 @@ def main() -> None:
             f"Selected shock = {parallel_shock_bp:+d} bp with scenario '{curve_scenario}'. "
             f"Current shocked iNAV = ${current_shocked_nav:,.2f} ({nav_move_pct:+.2f}%)."
         )
+
+    st.markdown("---")
+    st.subheader("Basket pricing detail")
+    nav_cols = st.columns(3)
+    nav_specs = [
+        ("iNAV at last trade", pricing_waterfall_metrics["nav_last_trade"], pricing_waterfall_metrics["nav_last_trade_bp"]),
+        ("iNAV at evaluated", pricing_waterfall_metrics["nav_evaluated"], pricing_waterfall_metrics["nav_evaluated_bp"]),
+        ("iNAV chosen", pricing_waterfall_metrics["nav_chosen"], pricing_waterfall_metrics["nav_chosen_bp"]),
+    ]
+    for col, (label, value, bp_diff) in zip(nav_cols, nav_specs):
+        with col:
+            st.metric(label, f"${value:,.2f}", delta=f"{bp_diff:+.2f} bp vs last-trade basket")
+    st.caption("Chosen marks switch from last-trade prints to evaluated marks once basket staleness exceeds 30 seconds.")
+    st.dataframe(
+        style_pricing_detail_table(pricing_detail_df),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.markdown("---")
+    st.subheader("AP economics")
+    signal_cols = st.columns(2)
+    with signal_cols[0]:
+        render_signal_tile("Create arb (bp)", ap_economics["create_arb_bp"])
+    with signal_cols[1]:
+        render_signal_tile("Redeem arb (bp)", ap_economics["redeem_arb_bp"])
+
+    ap_detail_cols = st.columns(4)
+    ap_specs = [
+        ("Basket bid NAV", f"${ap_economics['basket_bid_nav']:.2f}", None),
+        ("Basket offer NAV", f"${ap_economics['basket_offer_nav']:.2f}", None),
+        ("Create cost", f"{ap_economics['create_cost_bp']:.1f} bp", None),
+        ("Redeem cost", f"{ap_economics['redeem_cost_bp']:.1f} bp", None),
+    ]
+    for col, (label, value, delta) in zip(ap_detail_cols, ap_specs):
+        with col:
+            st.metric(label, value, delta=delta)
 
     st.markdown("---")
     interp_col, desk_col = st.columns(2)
