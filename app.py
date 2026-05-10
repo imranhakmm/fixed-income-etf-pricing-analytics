@@ -301,7 +301,7 @@ def format_interpretation(
         f"Curve shock logic is most sensitive in the {dominant_bucket['bucket']} bucket, which carries {dominant_bucket['weight_pct']:.1f}% of exposure."
     )
     bullets.append(
-        f"At the selected shock, the NAV anchor maps to ${metrics['current_shocked_nav']:.2f}, versus the benchmark input of ${metrics['nav_base_input']:.2f}."
+        f"At the selected shock, the NAV anchor maps to {metrics['current_shocked_nav']:.2f}, versus the benchmark input of {metrics['nav_base_input']:.2f}."
     )
     return bullets[:6]
 
