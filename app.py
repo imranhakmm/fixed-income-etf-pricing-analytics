@@ -13,6 +13,8 @@ from pricing import build_cashflows, duration_convexity_from_ytm
 
 
 APP_DIR = Path(__file__).resolve().parent
+APP_TIMESTAMP = pd.Timestamp.now(tz="Europe/London")
+APP_DATE = APP_TIMESTAMP.tz_localize(None).normalize()
 ETF_FILE_MAP = {
     "IEF": APP_DIR / "data" / "ief_holdings_realistic.csv",
     "LQD": APP_DIR / "data" / "lqd_holdings_realistic.csv",
@@ -31,6 +33,11 @@ DEFAULT_PORTFOLIO_NOTIONAL_USD = 10_000_000
 TY_DV01_PER_BP_USD = 76.0  # Approximate TY futures DV01 per 1 bp using a CTD-style desk assumption.
 CDX_IG_DV01_PER_BP_USD = 4500.0  # Approximate CDX IG DV01 per 1 bp for $10mm index notional.
 PD_DISPLAY_OPTIONS = ["bp", "%"]
+PD_HISTORY_LOOKBACK_DAYS = 90
+PD_HISTORY_DAILY_SD_BP = {
+    "IEF": 1.0,
+    "LQD": 5.0,
+}
 
 REQUIRED_COLUMNS = [
     "cusip",
@@ -274,7 +281,7 @@ def prepare_holdings(raw_df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
     if abs(weight_sum - 100.0) > 0.5:
         messages.append(f"weight_pct sums to {weight_sum:.2f}; calculations will be normalized to 100%.")
 
-    today = pd.Timestamp.today().normalize()
+    today = APP_DATE
     df["weight_share"] = df["weight_pct"] / weight_sum
     df["years_to_maturity"] = ((df["maturity"] - today).dt.days / 365.25).clip(lower=0)
     df["bucket"] = df["years_to_maturity"].apply(assign_bucket)
@@ -329,6 +336,21 @@ def dv01_per_10mm_from_per_100(dv01_per_100: float) -> float:
 
 def compute_cdx_ig_hedge_notional(dv01_per_10mm: float) -> float:
     return round((dv01_per_10mm / CDX_IG_DV01_PER_BP_USD) * DEFAULT_PORTFOLIO_NOTIONAL_USD)
+
+
+def build_synthetic_pd_history(etf_code: str, current_pd_bp: float) -> pd.DataFrame:
+    history_dates = pd.bdate_range(end=APP_DATE, periods=PD_HISTORY_LOOKBACK_DAYS)
+    rng = np.random.default_rng(stable_seed_from_cusip(f"{etf_code}-pd-history"))
+    pd_changes = rng.normal(0.0, PD_HISTORY_DAILY_SD_BP[etf_code], len(history_dates))
+    pd_levels = np.cumsum(pd_changes)
+    pd_levels = pd_levels - pd_levels[-1] + current_pd_bp
+    history_df = pd.DataFrame({"date": history_dates, "pd_bp": pd_levels})
+    mean_bp = float(history_df["pd_bp"].mean())
+    sigma_bp = float(history_df["pd_bp"].std(ddof=0))
+    history_df["mean_bp"] = mean_bp
+    history_df["upper_band_bp"] = mean_bp + (2.0 * sigma_bp)
+    history_df["lower_band_bp"] = mean_bp - (2.0 * sigma_bp)
+    return history_df
 
 
 def apply_cashflow_risk_overrides(df: pd.DataFrame, settlement_date: pd.Timestamp) -> pd.DataFrame:
@@ -455,6 +477,13 @@ def build_bucket_chart_data(df: pd.DataFrame) -> pd.DataFrame:
 
 def build_top_holdings(df: pd.DataFrame, n: int = 10) -> pd.DataFrame:
     return df.nlargest(n, "weight_pct").sort_values("weight_pct", ascending=True).copy()
+
+
+def build_dv01_contributors(df: pd.DataFrame) -> pd.DataFrame:
+    contributors = df.copy()
+    contributors["dv01_per_100"] = contributors["weight_share"] * contributors["clean_price"] * contributors["duration"] * 0.0001
+    contributors["dv01_per_10mm"] = contributors["dv01_per_100"] * (DEFAULT_PORTFOLIO_NOTIONAL_USD / 100.0)
+    return contributors.nlargest(10, "dv01_per_10mm").sort_values("dv01_per_10mm", ascending=True)
 
 
 def make_metric_cards(
@@ -659,6 +688,58 @@ def plot_sensitivity_curve(curve_df: pd.DataFrame, current_shock_bp: int, curren
     return fig
 
 
+def plot_pd_history(history_df: pd.DataFrame) -> go.Figure:
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=history_df["date"],
+            y=history_df["pd_bp"],
+            mode="lines",
+            line=dict(color=PALETTE[0], width=2.5),
+            name="P/D",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=history_df["date"],
+            y=history_df["upper_band_bp"],
+            mode="lines",
+            line=dict(color="#94A3B8", width=1, dash="dash"),
+            name="+2σ band",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=history_df["date"],
+            y=history_df["lower_band_bp"],
+            mode="lines",
+            line=dict(color="#94A3B8", width=1, dash="dash"),
+            fill="tonexty",
+            fillcolor="rgba(148, 163, 184, 0.14)",
+            name="-2σ band",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=history_df["date"],
+            y=history_df["mean_bp"],
+            mode="lines",
+            line=dict(color=PALETTE[1], width=1.5, dash="dot"),
+            name="Mean",
+        )
+    )
+    fig.update_layout(
+        template="plotly_white",
+        title="Premium / Discount History",
+        xaxis_title="Date",
+        yaxis_title="P/D (bp)",
+        margin=dict(l=10, r=10, t=50, b=10),
+        height=320,
+        legend_title_text="",
+    )
+    return fig
+
+
 def plot_duration_yield_scatter(df: pd.DataFrame) -> go.Figure:
     fig = px.scatter(
         df,
@@ -687,6 +768,28 @@ def plot_duration_yield_scatter(df: pd.DataFrame) -> go.Figure:
         margin=dict(l=10, r=10, t=50, b=10),
         height=420,
         legend_title_text="Maturity bucket",
+    )
+    return fig
+
+
+def plot_dv01_contributors(contributors_df: pd.DataFrame) -> go.Figure:
+    fig = px.bar(
+        contributors_df,
+        x="dv01_per_10mm",
+        y="description",
+        orientation="h",
+        text="dv01_per_10mm",
+        color_discrete_sequence=[PALETTE[2]],
+    )
+    fig.update_traces(texttemplate="$%{text:,.0f}", textposition="outside", cliponaxis=False)
+    fig.update_layout(
+        template="plotly_white",
+        title="Top DV01 Contributors",
+        xaxis_title="DV01 per $10mm",
+        yaxis_title="Holding",
+        margin=dict(l=10, r=10, t=50, b=10),
+        height=360,
+        showlegend=False,
     )
     return fig
 
@@ -742,6 +845,24 @@ def style_pricing_detail_table(df: pd.DataFrame) -> pd.DataFrame:
     ]
 
 
+def style_dv01_contributors_table(df: pd.DataFrame) -> pd.DataFrame:
+    display = df.copy()
+    numeric_columns = ["weight_pct", "duration", "yield_pct", "dv01_per_100", "dv01_per_10mm"]
+    for column in numeric_columns:
+        display[column] = display[column].astype(float).round(3 if "dv01" in column else 2)
+    return display[
+        [
+            "cusip",
+            "description",
+            "weight_pct",
+            "yield_pct",
+            "duration",
+            "dv01_per_100",
+            "dv01_per_10mm",
+        ]
+    ]
+
+
 def render_signal_tile(label: str, value: float) -> None:
     signal_class = "signal-neutral"
     if value > 0:
@@ -768,6 +889,7 @@ def main() -> None:
     inject_css()
 
     st.title("Fixed Income ETF Fair Value & Basket Analytics")
+    st.caption(f"As of {APP_TIMESTAMP:%Y-%m-%d %H:%M} London")
     st.caption("Basket-level pricing, iNAV proxy monitoring, DV01, curve shock sensitivity and basket diagnostics for Treasury and IG credit ETFs.")
     st.info(DISCLAIMER)
 
@@ -789,7 +911,7 @@ def main() -> None:
         "Compute duration from cashflows",
         key="compute_duration_from_cashflows",
     )
-    settlement_date = pd.Timestamp.today().normalize()
+    settlement_date = APP_DATE
     if compute_duration_from_cashflows:
         holdings_df = apply_cashflow_risk_overrides(holdings_df, settlement_date)
 
@@ -903,115 +1025,181 @@ def main() -> None:
         "redeem_arb_bp": ap_economics["redeem_arb_bp"],
     }
 
-    make_metric_cards(metrics=metrics, etf_code=selected_etf_code)
-    if compute_duration_from_cashflows:
-        st.caption("Duration computed from cashflows.")
-
-    st.markdown("---")
-    st.subheader("Basket diagnostics")
-
     bucket_df = build_bucket_chart_data(holdings_df)
     top_holdings_df = build_top_holdings(holdings_df, n=10)
+    dv01_contributors_df = build_dv01_contributors(holdings_df)
     sensitivity_df = compute_sensitivity_curve(
         holdings_df,
         base_nav=inav_proxy,
         scenario=curve_scenario,
         liquidity_penalty_pct=0.0,
     )
+    pd_history_df = build_synthetic_pd_history(selected_etf_code, premium_discount_bp)
+    interpretation_bullets = format_interpretation(metrics, bucket_df)
 
-    chart_col_1, chart_col_2 = st.columns(2)
-    with chart_col_1:
-        st.plotly_chart(plot_bucket_exposure(bucket_df), use_container_width=True)
-    with chart_col_2:
-        st.plotly_chart(plot_top_holdings(top_holdings_df), use_container_width=True)
-
-    st.plotly_chart(
-        plot_sensitivity_curve(
-            sensitivity_df,
-            current_shock_bp=parallel_shock_bp,
-            current_nav=inav_proxy,
-        ),
-        use_container_width=True,
+    overview_tab, sensitivity_tab, ap_tab, hedging_tab, method_tab = st.tabs(
+        ["Overview", "Sensitivity", "AP economics", "Hedging", "Method"]
     )
 
-    lower_col_1, lower_col_2 = st.columns([1.05, 1.25])
-    with lower_col_1:
-        st.plotly_chart(plot_duration_yield_scatter(holdings_df), use_container_width=True)
-    with lower_col_2:
-        display_df = holdings_df.copy()
-        display_df["shocked_price"] = shocked_prices
-        st.markdown("### Holdings table")
+    with overview_tab:
+        make_metric_cards(metrics=metrics, etf_code=selected_etf_code)
+        if compute_duration_from_cashflows:
+            st.caption("Duration computed from cashflows.")
+
+        st.plotly_chart(plot_pd_history(pd_history_df), use_container_width=True)
+        st.caption(
+            "Illustrative - synthetic history. The series is a seeded random walk with daily P/D volatility "
+            f"set to about {PD_HISTORY_DAILY_SD_BP[selected_etf_code]:.0f} bp for {selected_etf_code}."
+        )
+
+        interp_col, desk_col = st.columns(2)
+        with interp_col:
+            st.subheader("Interpretation")
+            st.markdown("\n".join(f"- {bullet}" for bullet in interpretation_bullets))
+        with desk_col:
+            st.subheader("Desk relevance")
+            st.markdown(
+                "\n".join(
+                    [
+                        "- Basket valuation to approximate iNAV from constituent bond marks.",
+                        "- DV01 and hedge sizing to map ETF risk into TY futures or CDX IG trader units.",
+                        "- Premium/discount monitoring to compare last trade against a live basket proxy rather than a static NAV input.",
+                        "- Liquidity and concentration diagnostics to support AP-style execution, hedging and basis discussions.",
+                        "- A compact prototype that mirrors how a fixed-income ETF desk frames iNAV, basis and hedge questions intraday.",
+                    ]
+                )
+            )
+
+        st.caption(
+            f"Model summary: iNAV ${inav_proxy:,.2f}; last trade ${market_price:,.2f}; duration {weighted_duration:.2f} yrs; "
+            f"convexity {weighted_convexity:.1f}; weighted liquidity score {weighted_liquidity_score:.2f}/5."
+        )
+
+    with sensitivity_tab:
+        st.subheader("Basket diagnostics")
+        chart_col_1, chart_col_2 = st.columns(2)
+        with chart_col_1:
+            st.plotly_chart(plot_bucket_exposure(bucket_df), use_container_width=True)
+        with chart_col_2:
+            st.plotly_chart(plot_top_holdings(top_holdings_df), use_container_width=True)
+
+        st.plotly_chart(
+            plot_sensitivity_curve(
+                sensitivity_df,
+                current_shock_bp=parallel_shock_bp,
+                current_nav=inav_proxy,
+            ),
+            use_container_width=True,
+        )
+
+        lower_col_1, lower_col_2 = st.columns([1.05, 1.25])
+        with lower_col_1:
+            st.plotly_chart(plot_duration_yield_scatter(holdings_df), use_container_width=True)
+        with lower_col_2:
+            display_df = holdings_df.copy()
+            display_df["shocked_price"] = shocked_prices
+            st.markdown("### Holdings table")
+            st.dataframe(
+                style_holdings_table(display_df),
+                use_container_width=True,
+                hide_index=True,
+            )
+            st.caption(
+                f"Selected shock = {parallel_shock_bp:+d} bp with scenario '{curve_scenario}'. "
+                f"Current shocked iNAV = ${current_shocked_nav:,.2f} ({nav_move_pct:+.2f}%)."
+            )
+
+        st.markdown("---")
+        st.subheader("Basket pricing detail")
+        nav_cols = st.columns(3)
+        nav_specs = [
+            ("iNAV at last trade", pricing_waterfall_metrics["nav_last_trade"], pricing_waterfall_metrics["nav_last_trade_bp"]),
+            ("iNAV at evaluated", pricing_waterfall_metrics["nav_evaluated"], pricing_waterfall_metrics["nav_evaluated_bp"]),
+            ("iNAV chosen", pricing_waterfall_metrics["nav_chosen"], pricing_waterfall_metrics["nav_chosen_bp"]),
+        ]
+        for col, (label, value, bp_diff) in zip(nav_cols, nav_specs):
+            with col:
+                st.metric(label, f"${value:,.2f}", delta=f"{bp_diff:+.2f} bp vs last-trade basket")
+        st.caption("Chosen marks switch from last-trade prints to evaluated marks once basket staleness exceeds 30 seconds.")
         st.dataframe(
-            style_holdings_table(display_df),
+            style_pricing_detail_table(pricing_detail_df),
             use_container_width=True,
             hide_index=True,
         )
+
+    with ap_tab:
+        st.subheader("AP economics")
+        signal_cols = st.columns(2)
+        with signal_cols[0]:
+            render_signal_tile("Create arb (bp)", ap_economics["create_arb_bp"])
+        with signal_cols[1]:
+            render_signal_tile("Redeem arb (bp)", ap_economics["redeem_arb_bp"])
+
+        ap_detail_cols = st.columns(4)
+        ap_specs = [
+            ("Basket bid NAV", f"${ap_economics['basket_bid_nav']:.2f}", None),
+            ("Basket offer NAV", f"${ap_economics['basket_offer_nav']:.2f}", None),
+            ("Create cost", f"{ap_economics['create_cost_bp']:.1f} bp", None),
+            ("Redeem cost", f"{ap_economics['redeem_cost_bp']:.1f} bp", None),
+        ]
+        for col, (label, value, delta) in zip(ap_detail_cols, ap_specs):
+            with col:
+                st.metric(label, value, delta=delta)
         st.caption(
-            f"Selected shock = {parallel_shock_bp:+d} bp with scenario '{curve_scenario}'. "
-            f"Current shocked iNAV = ${current_shocked_nav:,.2f} ({nav_move_pct:+.2f}%)."
+            "Create/redeem economics compare the ETF last trade against the basket proxy after half-spread, financing and crossing assumptions."
         )
 
-    st.markdown("---")
-    st.subheader("Basket pricing detail")
-    nav_cols = st.columns(3)
-    nav_specs = [
-        ("iNAV at last trade", pricing_waterfall_metrics["nav_last_trade"], pricing_waterfall_metrics["nav_last_trade_bp"]),
-        ("iNAV at evaluated", pricing_waterfall_metrics["nav_evaluated"], pricing_waterfall_metrics["nav_evaluated_bp"]),
-        ("iNAV chosen", pricing_waterfall_metrics["nav_chosen"], pricing_waterfall_metrics["nav_chosen_bp"]),
-    ]
-    for col, (label, value, bp_diff) in zip(nav_cols, nav_specs):
-        with col:
-            st.metric(label, f"${value:,.2f}", delta=f"{bp_diff:+.2f} bp vs last-trade basket")
-    st.caption("Chosen marks switch from last-trade prints to evaluated marks once basket staleness exceeds 30 seconds.")
-    st.dataframe(
-        style_pricing_detail_table(pricing_detail_df),
-        use_container_width=True,
-        hide_index=True,
-    )
+    with hedging_tab:
+        st.subheader("Hedge construction")
+        hedge_summary_cols = st.columns(4 if selected_etf_code == "LQD" else 3)
+        hedge_summaries = [
+            ("DV01 / $100", f"${dv01_per_100:.3f}"),
+            ("DV01 / $10mm", f"${dv01_per_10mm:,.0f}"),
+            ("TY hedge", f"{ty_hedge_contracts} contracts"),
+        ]
+        if selected_etf_code == "LQD":
+            hedge_summaries.append(("CDX IG hedge", f"${cdx_ig_hedge_notional:,.0f} notional"))
+        for col, (label, value) in zip(hedge_summary_cols, hedge_summaries):
+            with col:
+                st.metric(label, value)
 
-    st.markdown("---")
-    st.subheader("AP economics")
-    signal_cols = st.columns(2)
-    with signal_cols[0]:
-        render_signal_tile("Create arb (bp)", ap_economics["create_arb_bp"])
-    with signal_cols[1]:
-        render_signal_tile("Redeem arb (bp)", ap_economics["redeem_arb_bp"])
+        hedge_text_col, hedge_chart_col = st.columns([0.9, 1.1])
+        with hedge_text_col:
+            st.markdown(
+                "\n".join(
+                    [
+                        "- Parallel-rate DV01 is translated into TY contracts using a $76 per bp desk assumption for the hedge future.",
+                        "- The hedge is sized on a $10mm ETF risk unit so the number maps to an AP-style inventory conversation.",
+                        "- TY neutralises first-order rates risk; residual P&L remains in curve shape, credit basis and mark quality.",
+                        "- For LQD, CDX IG gives a separate credit hedge anchor alongside the rates hedge.",
+                    ]
+                )
+            )
+        with hedge_chart_col:
+            st.plotly_chart(plot_dv01_contributors(dv01_contributors_df), use_container_width=True)
 
-    ap_detail_cols = st.columns(4)
-    ap_specs = [
-        ("Basket bid NAV", f"${ap_economics['basket_bid_nav']:.2f}", None),
-        ("Basket offer NAV", f"${ap_economics['basket_offer_nav']:.2f}", None),
-        ("Create cost", f"{ap_economics['create_cost_bp']:.1f} bp", None),
-        ("Redeem cost", f"{ap_economics['redeem_cost_bp']:.1f} bp", None),
-    ]
-    for col, (label, value, delta) in zip(ap_detail_cols, ap_specs):
-        with col:
-            st.metric(label, value, delta=delta)
+        st.dataframe(
+            style_dv01_contributors_table(dv01_contributors_df),
+            use_container_width=True,
+            hide_index=True,
+        )
 
-    st.markdown("---")
-    interp_col, desk_col = st.columns(2)
-    with interp_col:
-        st.subheader("Interpretation")
-        interpretation_bullets = format_interpretation(metrics, bucket_df)
-        st.markdown("\n".join(f"- {bullet}" for bullet in interpretation_bullets))
-    with desk_col:
-        st.subheader("Desk relevance")
+    with method_tab:
+        st.subheader("Method")
         st.markdown(
             "\n".join(
                 [
-                    "- Basket valuation to approximate iNAV from constituent bond marks.",
-                    "- DV01 and hedge sizing to map ETF risk into TY futures or CDX IG trader units.",
-                    "- Premium/discount monitoring to compare last trade against a live basket proxy rather than a static NAV input.",
-                    "- Liquidity and concentration diagnostics to support AP-style execution, hedging and basis discussions.",
-                    "- A compact prototype that mirrors how a fixed-income ETF desk frames iNAV, basis and hedge questions intraday.",
+                    "- `iNAV proxy`: weighted clean-price basket mark built from the uploaded or bundled holdings file.",
+                    "- `Cashflow pricing`: when enabled, Treasury duration and convexity are recomputed from coupon cashflows and YTM using a ±1 bp numerical bump.",
+                    "- `Sensitivity`: shocked basket prices use duration-convexity repricing under parallel moves plus optional curve steepener/flattener overlays.",
+                    "- `AP economics`: create/redeem logic applies half-spread basket costs plus financing and crossing assumptions to judge whether the basis clears frictions.",
+                    "- `Hedging`: ETF DV01 is translated into TY futures and, for LQD, CDX IG notional to mirror trader sizing language.",
                 ]
             )
         )
-
-    st.caption(
-        f"Model summary: iNAV ${inav_proxy:,.2f} | last trade ${market_price:,.2f} | duration {weighted_duration:.2f} yrs | "
-        f"convexity {weighted_convexity:.1f} | weighted liquidity score {weighted_liquidity_score:.2f}/5."
-    )
+        st.caption(
+            "The app is designed as a transparent prototype: realistic illustrative baskets, desk-style units, and explicit market-friction assumptions rather than opaque model complexity."
+        )
 
 
 if __name__ == "__main__":
