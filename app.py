@@ -10,7 +10,24 @@ import streamlit as st
 
 
 APP_DIR = Path(__file__).resolve().parent
-SAMPLE_HOLDINGS_PATH = APP_DIR / "data" / "sample_ief_holdings.csv"
+ETF_FILE_MAP = {
+    "IEF": APP_DIR / "data" / "ief_holdings_realistic.csv",
+    "LQD": APP_DIR / "data" / "lqd_holdings_realistic.csv",
+}
+ETF_LABEL_MAP = {
+    "IEF (Treasury)": "IEF",
+    "LQD (IG Credit)": "LQD",
+}
+ETF_DEFAULT_PD_BP = {
+    "IEF": 4.0,
+    "LQD": 18.0,
+}
+DEFAULT_STALENESS_SECONDS = 15
+STALE_MARK_WARNING_SECONDS = 60
+DEFAULT_PORTFOLIO_NOTIONAL_USD = 10_000_000
+TY_DV01_PER_BP_USD = 76.0  # Approximate TY futures DV01 per 1 bp using a CTD-style desk assumption.
+CDX_IG_DV01_PER_BP_USD = 4500.0  # Approximate CDX IG DV01 per 1 bp for $10mm index notional.
+PD_DISPLAY_OPTIONS = ["bp", "%"]
 
 REQUIRED_COLUMNS = [
     "cusip",
@@ -48,9 +65,9 @@ CURVE_TWISTS = {
 
 PALETTE = ["#0F4C81", "#1D6F42", "#556B8E", "#8AA1B1", "#B08968"]
 DISCLAIMER = (
-    "This is an educational approximation of fixed-income ETF basket analytics. "
-    "It uses synthetic holdings and simplified duration-convexity pricing. "
-    "It is not intended to produce tradable prices, investment advice or production-grade ETF valuations."
+    "This is an educational approximation of fixed-income ETF basket analytics and iNAV monitoring. "
+    "It uses realistic illustrative baskets, simplified AP economics, and duration-convexity pricing. "
+    "It is not intended to replace issuer iNAV, executable AP cost models, or production-grade ETF valuations."
 )
 
 
@@ -151,6 +168,35 @@ def inject_css() -> None:
             font-size: 0.95rem;
             line-height: 1.4;
         }
+        .stale-caption {
+            margin-top: 0.15rem;
+            color: #9B2C2C;
+            font-size: 0.8rem;
+            line-height: 1.2;
+        }
+        .signal-card {
+            border-radius: 14px;
+            border: 1px solid #D8E0E8;
+            padding: 0.9rem 1rem;
+            background: #FFFFFF;
+        }
+        .signal-card__label {
+            color: #52606D;
+            font-size: 0.88rem;
+            margin-bottom: 0.35rem;
+        }
+        .signal-card__value {
+            font-family: var(--app-font-mono);
+            font-size: 1.75rem;
+            font-weight: 600;
+            color: #102A43;
+        }
+        .signal-positive .signal-card__value {
+            color: #1D6F42;
+        }
+        .signal-negative .signal-card__value {
+            color: #9B2C2C;
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -236,34 +282,46 @@ def prepare_holdings(raw_df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
 
 
 @st.cache_data(show_spinner=False)
-def load_sample_holdings() -> pd.DataFrame:
-    return pd.read_csv(SAMPLE_HOLDINGS_PATH)
+def load_sample_holdings(etf_code: str) -> pd.DataFrame:
+    return pd.read_csv(ETF_FILE_MAP[etf_code])
 
 
-def load_holdings(uploaded_file) -> tuple[pd.DataFrame, str, list[str]]:
+def load_holdings(uploaded_file, etf_code: str) -> tuple[pd.DataFrame, str, list[str]]:
     if uploaded_file is None:
-        sample_df = load_sample_holdings()
+        sample_df = load_sample_holdings(etf_code)
         prepared, messages = prepare_holdings(sample_df)
-        return prepared, "Sample holdings", messages
+        return prepared, f"Illustrative {etf_code} basket", messages
 
     try:
         raw_df = pd.read_csv(uploaded_file)
         prepared, messages = prepare_holdings(raw_df)
         return prepared, "Uploaded holdings", messages
     except ValueError as exc:
-        sample_df = load_sample_holdings()
+        sample_df = load_sample_holdings(etf_code)
         prepared, messages = prepare_holdings(sample_df)
-        messages = [f"{exc} Falling back to the sample holdings."] + messages
-        return prepared, "Sample holdings", messages
+        messages = [f"{exc} Falling back to the bundled {etf_code} basket."] + messages
+        return prepared, f"Illustrative {etf_code} basket", messages
     except Exception as exc:
-        sample_df = load_sample_holdings()
+        sample_df = load_sample_holdings(etf_code)
         prepared, messages = prepare_holdings(sample_df)
-        messages = [f"Could not read the uploaded CSV ({exc}). Falling back to the sample holdings."] + messages
-        return prepared, "Sample holdings", messages
+        messages = [f"Could not read the uploaded CSV ({exc}). Falling back to the bundled {etf_code} basket."] + messages
+        return prepared, f"Illustrative {etf_code} basket", messages
 
 
 def weighted_average(df: pd.DataFrame, column: str) -> float:
     return float((df["weight_share"] * df[column]).sum())
+
+
+def get_default_last_trade(etf_code: str, inav_proxy: float) -> float:
+    return round(inav_proxy * (1.0 + ETF_DEFAULT_PD_BP[etf_code] / 10000.0), 2)
+
+
+def dv01_per_10mm_from_per_100(dv01_per_100: float) -> float:
+    return dv01_per_100 * (DEFAULT_PORTFOLIO_NOTIONAL_USD / 100.0)
+
+
+def compute_cdx_ig_hedge_notional(dv01_per_10mm: float) -> float:
+    return round((dv01_per_10mm / CDX_IG_DV01_PER_BP_USD) * DEFAULT_PORTFOLIO_NOTIONAL_USD)
 
 
 def compute_bond_shocked_price(row: pd.Series, effective_shock_bp: float) -> float:
@@ -285,7 +343,7 @@ def compute_portfolio_value(df: pd.DataFrame, shock_bp: float, scenario: str, li
 
 def compute_sensitivity_curve(
     df: pd.DataFrame,
-    nav_base_input: float,
+    base_nav: float,
     scenario: str,
     liquidity_penalty_pct: float,
 ) -> pd.DataFrame:
@@ -295,7 +353,7 @@ def compute_sensitivity_curve(
     for shock_bp in shock_grid:
         shocked_value, _ = compute_portfolio_value(df, float(shock_bp), scenario, liquidity_penalty_pct)
         shock_factor = shocked_value / gross_base_value if gross_base_value else 1.0
-        values.append(nav_base_input * shock_factor)
+        values.append(base_nav * shock_factor)
     return pd.DataFrame({"shock_bp": shock_grid, "implied_nav": values})
 
 
@@ -313,60 +371,84 @@ def build_top_holdings(df: pd.DataFrame, n: int = 10) -> pd.DataFrame:
 
 
 def make_metric_cards(
-    estimated_fair_value: float,
-    market_price: float,
-    premium_discount_pct: float,
-    weighted_duration: float,
-    dv01_proxy: float,
-    weighted_bid_ask_bps: float,
+    metrics: dict,
+    etf_code: str,
 ) -> None:
-    metric_specs = [
-        ("Estimated fair value", f"${estimated_fair_value:,.2f}", None),
-        ("Market price", f"${market_price:,.2f}", None),
-        ("Premium / discount", f"{premium_discount_pct:+.2f}%", f"{market_price - estimated_fair_value:+.2f} vs fair"),
-        ("Weighted duration", f"{weighted_duration:.2f} yrs", None),
-        ("DV01 proxy", f"${dv01_proxy:,.3f}", None),
-        ("Weighted bid/ask", f"{weighted_bid_ask_bps:.2f} bps", None),
+    headline_cols = st.columns(4)
+    with headline_cols[0]:
+        st.metric("iNAV (basket)", f"${metrics['inav_proxy']:,.2f}")
+    with headline_cols[1]:
+        st.metric("Last trade", f"${metrics['last_trade']:,.2f}")
+    with headline_cols[2]:
+        st.segmented_control(
+            "P/D display",
+            options=PD_DISPLAY_OPTIONS,
+            default="bp",
+            key="pd_display_unit",
+            label_visibility="collapsed",
+        )
+        pd_display_unit = st.session_state.get("pd_display_unit", "bp")
+        pd_label = "P/D (bps)" if pd_display_unit == "bp" else "P/D (%)"
+        pd_value = (
+            f"{metrics['premium_discount_bp']:+.1f} bp"
+            if pd_display_unit == "bp"
+            else f"{metrics['premium_discount_pct']:+.3f}%"
+        )
+        st.metric(pd_label, pd_value, delta=f"{metrics['last_trade'] - metrics['inav_proxy']:+.2f} vs iNAV")
+        if metrics["staleness_seconds"] > STALE_MARK_WARNING_SECONDS:
+            st.markdown('<div class="stale-caption">stale basket marks</div>', unsafe_allow_html=True)
+    with headline_cols[3]:
+        st.metric("Staleness (s)", f"{int(metrics['staleness_seconds'])}")
+
+    risk_specs = [
+        ("Weighted duration", f"{metrics['weighted_duration']:.2f} yrs", None),
+        ("Weighted convexity", f"{metrics['weighted_convexity']:.1f}", None),
     ]
-    for row_specs in (metric_specs[:3], metric_specs[3:]):
-        cols = st.columns(3)
-        for col, (label, value, delta) in zip(cols, row_specs):
-            with col:
-                st.metric(label, value, delta=delta)
+    risk_cols = st.columns(len(risk_specs))
+    for col, (label, value, delta) in zip(risk_cols, risk_specs):
+        with col:
+            st.metric(label, value, delta=delta)
+
+    hedge_specs = [
+        (
+            "DV01",
+            f"${metrics['dv01_per_100']:.3f} / $100  ·  ${metrics['dv01_per_10mm']:,.0f} / $10mm",
+            None,
+        ),
+        ("TY hedge", f"{metrics['ty_hedge_contracts']} TY contracts / $10mm", None),
+    ]
+    if etf_code == "LQD":
+        hedge_specs.append(
+            ("CDX IG hedge", f"${metrics['cdx_ig_hedge_notional']:,.0f} CDX IG notional / $10mm", None)
+        )
+    hedge_cols = st.columns(len(hedge_specs))
+    for col, (label, value, delta) in zip(hedge_cols, hedge_specs):
+        with col:
+            st.metric(label, value, delta=delta)
+
+    tertiary_specs = [
+        ("Weighted bid/ask", f"{metrics['weighted_bid_ask_bps']:.2f} bps", None),
+        ("Top 5 concentration", f"{metrics['top_5_concentration']:.1f}%", None),
+        ("Liquidity score", f"{metrics['weighted_liquidity_score']:.2f} / 5", None),
+    ]
+    tertiary_cols = st.columns(len(tertiary_specs))
+    for col, (label, value, delta) in zip(tertiary_cols, tertiary_specs):
+        with col:
+            st.metric(label, value, delta=delta)
 
 
 def format_interpretation(
     metrics: dict,
     bucket_df: pd.DataFrame,
-    liquidity_toggle: bool,
 ) -> list[str]:
-    bullets: list[str] = []
-    direction = "rich" if metrics["premium_discount_pct"] > 0 else "cheap"
-    bullets.append(
-        f"ETF screens {direction} by {abs(metrics['premium_discount_pct']):.2f}% versus the basket estimate."
-    )
-    bullets.append(
-        f"Weighted duration of {metrics['weighted_duration']:.2f} implies roughly ${metrics['dv01_proxy']:.3f} of price sensitivity per 1 bp move."
-    )
-    bullets.append(
-        f"Top 5 holdings represent {metrics['top_5_concentration']:.1f}% of basket weight, so concentration is moderate but not trivial."
-    )
-    if liquidity_toggle:
-        bullets.append(
-            f"The liquidity haircut is active, trimming the basket by about {metrics['liquidity_penalty_pct'] * 100:.2f}% based on weighted bid/ask."
-        )
-    else:
-        bullets.append(
-            f"The weighted bid/ask spread is {metrics['weighted_bid_ask_bps']:.2f} bps with an average liquidity score of {metrics['weighted_liquidity_score']:.2f}/5."
-        )
+    direction = "rich" if metrics["premium_discount_bp"] > 0 else "cheap"
     dominant_bucket = bucket_df.sort_values("weight_pct", ascending=False).iloc[0]
-    bullets.append(
-        f"Curve shock logic is most sensitive in the {dominant_bucket['bucket']} bucket, which carries {dominant_bucket['weight_pct']:.1f}% of exposure."
-    )
-    bullets.append(
-        f"At the selected shock, the NAV anchor maps to {metrics['current_shocked_nav']:.2f}, versus the benchmark input of {metrics['nav_base_input']:.2f}."
-    )
-    return bullets[:6]
+    return [
+        f"Last trade is {abs(metrics['premium_discount_bp']):.1f} bp {direction} to the basket iNAV proxy at {metrics['inav_proxy']:.2f}.",
+        f"Portfolio DV01 is ${metrics['dv01_per_100']:.3f} per $100, which scales to roughly ${metrics['dv01_per_10mm']:,.0f} per bp on a $10mm line item.",
+        f"The basket is concentrated in the {dominant_bucket['bucket']} bucket ({dominant_bucket['weight_pct']:.1f}%) with top-5 weight at {metrics['top_5_concentration']:.1f}%.",
+        f"Current marks are {int(metrics['staleness_seconds'])} seconds old and the weighted bond bid/ask is {metrics['weighted_bid_ask_bps']:.2f} bp.",
+    ]
 
 
 def plot_bucket_exposure(bucket_df: pd.DataFrame) -> go.Figure:
@@ -516,46 +598,50 @@ def main() -> None:
     inject_css()
 
     st.title("Fixed Income ETF Fair Value & Basket Analytics")
-    st.caption("Basket-level pricing, duration/DV01, curve shock sensitivity and premium/discount diagnostics for a Treasury ETF.")
+    st.caption("Basket-level pricing, iNAV proxy monitoring, DV01, curve shock sensitivity and basket diagnostics for Treasury and IG credit ETFs.")
     st.info(DISCLAIMER)
 
+    selected_etf_label = st.sidebar.radio("ETF", options=list(ETF_LABEL_MAP.keys()), index=0)
+    selected_etf_code = ETF_LABEL_MAP[selected_etf_label]
     st.sidebar.markdown("### Controls")
     st.sidebar.caption(
-        "Upload a custom CSV or use the bundled synthetic IEF basket. Required columns: "
+        "Upload a custom CSV or use the bundled realistic illustrative basket. Required columns: "
         + ", ".join(REQUIRED_COLUMNS)
         + "."
     )
     uploaded_file = st.sidebar.file_uploader("Upload custom holdings CSV", type=["csv"])
 
-    holdings_df, data_source_label, load_messages = load_holdings(uploaded_file)
-    gross_basket_fv = weighted_average(holdings_df, "clean_price")
+    holdings_df, data_source_label, load_messages = load_holdings(uploaded_file, selected_etf_code)
+    inav_proxy = weighted_average(holdings_df, "clean_price")
 
-    data_seed = f"{data_source_label}:{len(holdings_df)}:{round(float(holdings_df['weight_pct'].sum()), 2)}"
-    if st.session_state.get("_nav_base_seed") != data_seed:
-        st.session_state.nav_base_default = round(gross_basket_fv, 2)
-        st.session_state._nav_base_seed = data_seed
+    data_seed = f"{selected_etf_code}:{data_source_label}:{len(holdings_df)}:{round(inav_proxy, 4)}"
+    if st.session_state.get("_snapshot_seed") != data_seed:
+        st.session_state.last_trade_input = get_default_last_trade(selected_etf_code, inav_proxy)
+        st.session_state.staleness_seconds = DEFAULT_STALENESS_SECONDS
+        st.session_state._snapshot_seed = data_seed
 
     for message in load_messages:
         st.sidebar.warning(message)
 
     st.sidebar.success(f"Using {data_source_label.lower()}.")
 
+    st.sidebar.markdown("### Snapshot")
     market_price = st.sidebar.number_input(
-        "ETF market price",
+        "ETF last trade ($)",
         min_value=0.0,
-        value=94.50,
         step=0.01,
         format="%.2f",
+        key="last_trade_input",
     )
-    nav_base_input = st.sidebar.number_input(
-        "NAV / base fair value",
-        min_value=0.0,
-        value=float(st.session_state.get("nav_base_default", round(gross_basket_fv, 2))),
-        step=0.01,
-        format="%.2f",
-        help="Defaults to the basket fair value and anchors the sensitivity line.",
-        key="nav_base_input",
+    staleness_seconds = st.sidebar.slider(
+        "Basket marks staleness (seconds)",
+        min_value=0,
+        max_value=300,
+        step=1,
+        key="staleness_seconds",
     )
+
+    st.sidebar.markdown("### Rate shock")
     parallel_shock_bp = st.sidebar.slider(
         "Parallel yield shock (bp)",
         min_value=-100,
@@ -568,18 +654,18 @@ def main() -> None:
         options=list(CURVE_TWISTS.keys()),
         index=0,
     )
-    liquidity_toggle = st.sidebar.toggle("Apply bid/ask liquidity penalty", value=False)
 
     weighted_duration = weighted_average(holdings_df, "duration")
     weighted_convexity = weighted_average(holdings_df, "convexity")
     weighted_bid_ask_bps = weighted_average(holdings_df, "bid_ask_bps")
     weighted_liquidity_score = weighted_average(holdings_df, "liquidity_score")
     top_5_concentration = float(holdings_df.nlargest(5, "weight_pct")["weight_pct"].sum())
-
-    liquidity_penalty_pct = (weighted_bid_ask_bps / 10000.0) if liquidity_toggle else 0.0
-    estimated_fair_value = gross_basket_fv * (1.0 - liquidity_penalty_pct)
-    dv01_proxy = estimated_fair_value * weighted_duration * 0.0001
-    premium_discount_pct = (market_price - estimated_fair_value) / estimated_fair_value * 100.0
+    dv01_per_100 = inav_proxy * weighted_duration * 0.0001
+    dv01_per_10mm = dv01_per_10mm_from_per_100(dv01_per_100)
+    ty_hedge_contracts = round(dv01_per_10mm / TY_DV01_PER_BP_USD)
+    cdx_ig_hedge_notional = compute_cdx_ig_hedge_notional(dv01_per_10mm) if selected_etf_code == "LQD" else None
+    premium_discount_pct = (market_price - inav_proxy) / inav_proxy * 100.0
+    premium_discount_bp = premium_discount_pct * 100.0
 
     current_shocked_gross_value, shocked_prices = compute_portfolio_value(
         holdings_df,
@@ -587,29 +673,28 @@ def main() -> None:
         curve_scenario,
         liquidity_penalty_pct=0.0,
     )
-    current_shocked_nav = nav_base_input * (current_shocked_gross_value / gross_basket_fv) * (1.0 - liquidity_penalty_pct)
-    nav_move_pct = ((current_shocked_nav - nav_base_input) / nav_base_input * 100.0) if nav_base_input else 0.0
+    current_shocked_nav = inav_proxy * (current_shocked_gross_value / inav_proxy)
+    nav_move_pct = ((current_shocked_nav - inav_proxy) / inav_proxy * 100.0) if inav_proxy else 0.0
 
     metrics = {
+        "inav_proxy": inav_proxy,
+        "last_trade": market_price,
+        "staleness_seconds": staleness_seconds,
         "weighted_duration": weighted_duration,
-        "dv01_proxy": dv01_proxy,
+        "weighted_convexity": weighted_convexity,
+        "dv01_per_100": dv01_per_100,
+        "dv01_per_10mm": dv01_per_10mm,
+        "ty_hedge_contracts": ty_hedge_contracts,
+        "cdx_ig_hedge_notional": cdx_ig_hedge_notional,
         "premium_discount_pct": premium_discount_pct,
+        "premium_discount_bp": premium_discount_bp,
         "top_5_concentration": top_5_concentration,
         "weighted_bid_ask_bps": weighted_bid_ask_bps,
         "weighted_liquidity_score": weighted_liquidity_score,
-        "liquidity_penalty_pct": liquidity_penalty_pct,
         "current_shocked_nav": current_shocked_nav,
-        "nav_base_input": nav_base_input,
     }
 
-    make_metric_cards(
-        estimated_fair_value=estimated_fair_value,
-        market_price=market_price,
-        premium_discount_pct=premium_discount_pct,
-        weighted_duration=weighted_duration,
-        dv01_proxy=dv01_proxy,
-        weighted_bid_ask_bps=weighted_bid_ask_bps,
-    )
+    make_metric_cards(metrics=metrics, etf_code=selected_etf_code)
 
     st.markdown("---")
     st.subheader("Basket diagnostics")
@@ -618,9 +703,9 @@ def main() -> None:
     top_holdings_df = build_top_holdings(holdings_df, n=10)
     sensitivity_df = compute_sensitivity_curve(
         holdings_df,
-        nav_base_input=nav_base_input,
+        base_nav=inav_proxy,
         scenario=curve_scenario,
-        liquidity_penalty_pct=liquidity_penalty_pct,
+        liquidity_penalty_pct=0.0,
     )
 
     chart_col_1, chart_col_2 = st.columns(2)
@@ -633,7 +718,7 @@ def main() -> None:
         plot_sensitivity_curve(
             sensitivity_df,
             current_shock_bp=parallel_shock_bp,
-            current_nav=nav_base_input * (1.0 - liquidity_penalty_pct),
+            current_nav=inav_proxy,
         ),
         use_container_width=True,
     )
@@ -652,32 +737,32 @@ def main() -> None:
         )
         st.caption(
             f"Selected shock = {parallel_shock_bp:+d} bp with scenario '{curve_scenario}'. "
-            f"Current shocked NAV = ${current_shocked_nav:,.2f} ({nav_move_pct:+.2f}%)."
+            f"Current shocked iNAV = ${current_shocked_nav:,.2f} ({nav_move_pct:+.2f}%)."
         )
 
     st.markdown("---")
     interp_col, desk_col = st.columns(2)
     with interp_col:
         st.subheader("Interpretation")
-        interpretation_bullets = format_interpretation(metrics, bucket_df, liquidity_toggle)
+        interpretation_bullets = format_interpretation(metrics, bucket_df)
         st.markdown("\n".join(f"- {bullet}" for bullet in interpretation_bullets))
     with desk_col:
         st.subheader("Desk relevance")
         st.markdown(
             "\n".join(
                 [
-                    "- Basket valuation to estimate ETF fair value from constituent bonds.",
-                    "- NAV sensitivity to understand how rate shocks flow through portfolio duration and convexity.",
-                    "- Premium/discount monitoring to separate cheap vs rich trading signals from headline market price.",
-                    "- Liquidity and concentration diagnostics to support execution, hedging, and risk sizing decisions.",
-                    "- A compact prototype that mirrors the workflow of a fixed-income ETF pricing / trading analyst.",
+                    "- Basket valuation to approximate iNAV from constituent bond marks.",
+                    "- DV01 and hedge sizing to map ETF risk into TY futures or CDX IG trader units.",
+                    "- Premium/discount monitoring to compare last trade against a live basket proxy rather than a static NAV input.",
+                    "- Liquidity and concentration diagnostics to support AP-style execution, hedging and basis discussions.",
+                    "- A compact prototype that mirrors how a fixed-income ETF desk frames iNAV, basis and hedge questions intraday.",
                 ]
             )
         )
 
     st.caption(
-        f"Model summary: fair value ${estimated_fair_value:,.2f} | duration {weighted_duration:.2f} yrs | "
-        f"convexity {weighted_convexity:.2f} | weighted liquidity score {weighted_liquidity_score:.2f}/5."
+        f"Model summary: iNAV ${inav_proxy:,.2f} | last trade ${market_price:,.2f} | duration {weighted_duration:.2f} yrs | "
+        f"convexity {weighted_convexity:.1f} | weighted liquidity score {weighted_liquidity_score:.2f}/5."
     )
 
 
