@@ -212,6 +212,38 @@ def inject_css() -> None:
         .signal-negative .signal-card__value {
             color: #9B2C2C;
         }
+        .compact-metric-card {
+            border-radius: 14px;
+            border: 1px solid #D8E0E8;
+            padding: 0.9rem 1rem;
+            background: #FFFFFF;
+            box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+            min-height: 128px;
+        }
+        .compact-metric-label {
+            color: #52606D;
+            font-size: 0.88rem;
+            margin-bottom: 0.35rem;
+        }
+        .compact-metric-value {
+            font-family: var(--app-font-mono);
+            font-size: 1.45rem;
+            font-weight: 700;
+            line-height: 1.12;
+            white-space: normal;
+            overflow-wrap: anywhere;
+            color: #102A43;
+        }
+        .compact-metric-secondary {
+            font-family: var(--app-font-mono);
+            font-size: 1.02rem;
+            font-weight: 600;
+            line-height: 1.12;
+            white-space: normal;
+            overflow-wrap: anywhere;
+            color: #52606D;
+            margin-top: 0.35rem;
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -568,7 +600,14 @@ def make_metric_cards(
     hedge_cols = st.columns(len(hedge_specs))
     for col, (label, value, delta) in zip(hedge_cols, hedge_specs):
         with col:
-            st.metric(label, value, delta=delta)
+            if label == "DV01":
+                render_compact_metric_tile(label, f"${metrics['dv01_per_100']:.3f} / $100", f"${metrics['dv01_per_10mm']:,.0f} / $10mm")
+            elif label == "TY hedge":
+                render_compact_metric_tile(label, f"{metrics['ty_hedge_contracts']} TY contracts", "per $10mm")
+            elif label == "CDX IG overlay":
+                render_compact_metric_tile(label, f"${metrics['cdx_ig_overlay_notional'] / 1_000_000:.1f}mm", "/ $10mm")
+            else:
+                st.metric(label, value, delta=delta)
     if etf_code == "LQD":
         st.caption("Sized off credit spread DV01, not rates DV01.")
 
@@ -913,6 +952,22 @@ def render_signal_tile(label: str, value: float) -> None:
         <div class="signal-card {signal_class}">
             <div class="signal-card__label">{label}</div>
             <div class="signal-card__value">{value:+.1f} bp</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_compact_metric_tile(label: str, primary_value: str, secondary_value: str | None = None) -> None:
+    secondary_html = ""
+    if secondary_value:
+        secondary_html = f'<div class="compact-metric-secondary">{secondary_value}</div>'
+    st.markdown(
+        f"""
+        <div class="compact-metric-card">
+            <div class="compact-metric-label">{label}</div>
+            <div class="compact-metric-value">{primary_value}</div>
+            {secondary_html}
         </div>
         """,
         unsafe_allow_html=True,
