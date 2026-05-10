@@ -76,6 +76,36 @@ def inject_css() -> None:
         }
         [data-testid="stSidebar"] {
             background: #F6F8FB;
+            color: #102A43;
+            border-right: 1px solid #D8E0E8;
+        }
+        [data-testid="stSidebar"] h1,
+        [data-testid="stSidebar"] h2,
+        [data-testid="stSidebar"] h3,
+        [data-testid="stSidebar"] h4,
+        [data-testid="stSidebar"] h5,
+        [data-testid="stSidebar"] h6,
+        [data-testid="stSidebar"] p,
+        [data-testid="stSidebar"] li,
+        [data-testid="stSidebar"] label,
+        [data-testid="stSidebar"] small,
+        [data-testid="stSidebar"] .stCaption,
+        [data-testid="stSidebar"] .stMarkdown,
+        [data-testid="stSidebar"] .stMarkdown * {
+            color: #102A43 !important;
+        }
+        [data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"],
+        [data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"] *,
+        [data-testid="stSidebar"] [data-baseweb="input"],
+        [data-testid="stSidebar"] [data-baseweb="select"] > div,
+        [data-testid="stSidebar"] input,
+        [data-testid="stSidebar"] textarea {
+            background-color: #FFFFFF !important;
+            color: #102A43 !important;
+            border-color: #D8E0E8 !important;
+        }
+        [data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"] * {
+            opacity: 1 !important;
         }
         [data-testid="stMetric"] {
             background: #FFFFFF;
