@@ -58,6 +58,17 @@ def inject_css() -> None:
     st.markdown(
         """
         <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
+
+        :root {
+            --app-font-sans: 'Inter', sans-serif;
+            --app-font-mono: 'JetBrains Mono', monospace;
+        }
+
+        html, body, .stApp, [data-testid="stAppViewContainer"], [data-testid="stSidebar"] {
+            font-family: var(--app-font-sans);
+        }
+
         .block-container {
             padding-top: 1.25rem;
             padding-bottom: 2rem;
@@ -75,13 +86,35 @@ def inject_css() -> None:
         }
         [data-testid="stMetricValue"] {
             color: #102A43;
+            font-family: var(--app-font-mono);
+            font-weight: 600;
+            letter-spacing: -0.03em;
         }
         [data-testid="stMetricLabel"] {
             color: #52606D;
             font-size: 0.88rem;
+            font-family: var(--app-font-sans);
         }
-        h1, h2, h3 {
+        [data-testid="stMetricDelta"] {
+            font-family: var(--app-font-mono);
+        }
+        h1, h2, h3, h4, h5, h6, p, li, label, span, div, button, input, textarea, select, small {
+            font-family: var(--app-font-sans);
             letter-spacing: -0.02em;
+        }
+        code, pre, kbd, samp, tt, .stCode, [data-testid="stCodeBlock"], .highlight {
+            font-family: var(--app-font-mono) !important;
+        }
+        .stMarkdown code {
+            font-family: var(--app-font-mono) !important;
+            background: rgba(15, 23, 42, 0.06);
+            color: #0F172A;
+            border-radius: 6px;
+            padding: 0.08rem 0.34rem;
+        }
+        .stMarkdown pre code {
+            background: transparent;
+            padding: 0;
         }
         .subtle-note {
             color: #52606D;
