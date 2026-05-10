@@ -29,9 +29,12 @@ ETF_DEFAULT_PD_BP = {
 }
 DEFAULT_STALENESS_SECONDS = 15
 STALE_MARK_WARNING_SECONDS = 60
+EVALUATED_MARK_SWITCH_SECONDS = 30
+SENSITIVITY_SHOCK_RANGE_BP = 300
 DEFAULT_PORTFOLIO_NOTIONAL_USD = 10_000_000
 TY_DV01_PER_BP_USD = 76.0  # Approximate TY futures DV01 per 1 bp using a CTD-style desk assumption.
 CDX_IG_DV01_PER_BP_USD = 4500.0  # Approximate CDX IG DV01 per 1 bp for $10mm index notional.
+SPREAD_DURATION_FACTOR = 0.95  # IG corporate spread duration ≈ rates duration in benign credit regimes; refine per-bond in production.
 PD_DISPLAY_OPTIONS = ["bp", "%"]
 PD_HISTORY_LOOKBACK_DAYS = 90
 PD_HISTORY_DAILY_SD_BP = {
@@ -52,6 +55,7 @@ REQUIRED_COLUMNS = [
     "bid_ask_bps",
     "liquidity_score",
 ]
+OPTIONAL_COLUMNS = ["spread_duration"]
 
 NUMERIC_COLUMNS = [
     "coupon",
@@ -63,6 +67,7 @@ NUMERIC_COLUMNS = [
     "bid_ask_bps",
     "liquidity_score",
 ]
+OPTIONAL_NUMERIC_COLUMNS = ["spread_duration"]
 
 BUCKET_ORDER = ["0-3y", "3-5y", "5-7y", "7-10y", "10y+"]
 CURVE_TWISTS = {
@@ -256,9 +261,13 @@ def prepare_holdings(raw_df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
             + f". Required columns: {required}."
         )
 
-    df = df[REQUIRED_COLUMNS].copy()
+    optional_columns = [column for column in OPTIONAL_COLUMNS if column in df.columns]
+    df = df[[*REQUIRED_COLUMNS, *optional_columns]].copy()
     for column in NUMERIC_COLUMNS:
         df[column] = to_numeric(df[column])
+    for column in OPTIONAL_NUMERIC_COLUMNS:
+        if column in df.columns:
+            df[column] = to_numeric(df[column])
     df["maturity"] = pd.to_datetime(df["maturity"], errors="coerce")
 
     critical_cols = ["cusip", "description", "maturity", *NUMERIC_COLUMNS]
@@ -296,24 +305,35 @@ def load_sample_holdings(etf_code: str) -> pd.DataFrame:
     return pd.read_csv(ETF_FILE_MAP[etf_code])
 
 
+def apply_etf_specific_fields(df: pd.DataFrame, etf_code: str) -> pd.DataFrame:
+    adjusted_df = df.copy()
+    if etf_code == "LQD":
+        adjusted_df["spread_duration"] = adjusted_df["duration"] * SPREAD_DURATION_FACTOR
+    return adjusted_df
+
+
 def load_holdings(uploaded_file, etf_code: str) -> tuple[pd.DataFrame, str, list[str]]:
     if uploaded_file is None:
         sample_df = load_sample_holdings(etf_code)
         prepared, messages = prepare_holdings(sample_df)
+        prepared = apply_etf_specific_fields(prepared, etf_code)
         return prepared, f"Illustrative {etf_code} basket", messages
 
     try:
         raw_df = pd.read_csv(uploaded_file)
         prepared, messages = prepare_holdings(raw_df)
+        prepared = apply_etf_specific_fields(prepared, etf_code)
         return prepared, "Uploaded holdings", messages
     except ValueError as exc:
         sample_df = load_sample_holdings(etf_code)
         prepared, messages = prepare_holdings(sample_df)
+        prepared = apply_etf_specific_fields(prepared, etf_code)
         messages = [f"{exc} Falling back to the bundled {etf_code} basket."] + messages
         return prepared, f"Illustrative {etf_code} basket", messages
     except Exception as exc:
         sample_df = load_sample_holdings(etf_code)
         prepared, messages = prepare_holdings(sample_df)
+        prepared = apply_etf_specific_fields(prepared, etf_code)
         messages = [f"Could not read the uploaded CSV ({exc}). Falling back to the bundled {etf_code} basket."] + messages
         return prepared, f"Illustrative {etf_code} basket", messages
 
@@ -334,8 +354,12 @@ def dv01_per_10mm_from_per_100(dv01_per_100: float) -> float:
     return dv01_per_100 * (DEFAULT_PORTFOLIO_NOTIONAL_USD / 100.0)
 
 
-def compute_cdx_ig_hedge_notional(dv01_per_10mm: float) -> float:
-    return round((dv01_per_10mm / CDX_IG_DV01_PER_BP_USD) * DEFAULT_PORTFOLIO_NOTIONAL_USD)
+def compute_credit_dv01_per_10mm(inav_proxy: float, weighted_spread_duration: float) -> float:
+    return inav_proxy * weighted_spread_duration * 0.0001 * (DEFAULT_PORTFOLIO_NOTIONAL_USD / 100.0)
+
+
+def compute_cdx_ig_overlay_notional(credit_dv01_per_10mm: float) -> float:
+    return (credit_dv01_per_10mm / CDX_IG_DV01_PER_BP_USD) * DEFAULT_PORTFOLIO_NOTIONAL_USD
 
 
 def build_synthetic_pd_history(etf_code: str, current_pd_bp: float) -> pd.DataFrame:
@@ -381,15 +405,13 @@ def stable_seed_from_cusip(cusip: str) -> int:
 
 def build_pricing_waterfall(df: pd.DataFrame, staleness_seconds: int) -> tuple[pd.DataFrame, dict]:
     pricing_df = df.copy()
-    evaluated_offsets = []
-    for row in pricing_df.itertuples(index=False):
-        rng = np.random.default_rng(stable_seed_from_cusip(row.cusip))
-        evaluated_offsets.append(rng.normal(0.0, row.bid_ask_bps / 100.0 / 4.0))
-
+    stale_factor = min(staleness_seconds / EVALUATED_MARK_SWITCH_SECONDS, 1.0)
     pricing_df["last_trade_price"] = pricing_df["clean_price"]
-    pricing_df["evaluated_price"] = pricing_df["clean_price"] + evaluated_offsets
+    pricing_df["evaluated_price"] = pricing_df["last_trade_price"] - (
+        (pricing_df["bid_ask_bps"] / 2.0 / 10000.0) * pricing_df["last_trade_price"] * stale_factor
+    )
     pricing_df["chosen_price"] = np.where(
-        staleness_seconds < 30,
+        staleness_seconds < EVALUATED_MARK_SWITCH_SECONDS,
         pricing_df["last_trade_price"],
         pricing_df["evaluated_price"],
     )
@@ -397,6 +419,7 @@ def build_pricing_waterfall(df: pd.DataFrame, staleness_seconds: int) -> tuple[p
     nav_last_trade = weighted_nav_from_series(pricing_df, pricing_df["last_trade_price"])
     nav_evaluated = weighted_nav_from_series(pricing_df, pricing_df["evaluated_price"])
     nav_chosen = weighted_nav_from_series(pricing_df, pricing_df["chosen_price"])
+    chosen_deltas_bp = ((pricing_df["chosen_price"] - pricing_df["last_trade_price"]) / pricing_df["last_trade_price"]) * 10000.0
     return pricing_df, {
         "nav_last_trade": nav_last_trade,
         "nav_evaluated": nav_evaluated,
@@ -404,6 +427,8 @@ def build_pricing_waterfall(df: pd.DataFrame, staleness_seconds: int) -> tuple[p
         "nav_last_trade_bp": 0.0,
         "nav_evaluated_bp": (nav_evaluated / nav_last_trade - 1.0) * 10000.0,
         "nav_chosen_bp": (nav_chosen / nav_last_trade - 1.0) * 10000.0,
+        "basket_dispersion_bp": float(chosen_deltas_bp.std(ddof=0)),
+        "stale_factor": stale_factor,
     }
 
 
@@ -457,13 +482,16 @@ def compute_sensitivity_curve(
     liquidity_penalty_pct: float,
 ) -> pd.DataFrame:
     gross_base_value = float((df["weight_share"] * df["clean_price"]).sum())
-    shock_grid = np.arange(-100, 101, 1)
+    weighted_duration = weighted_average(df, "duration")
+    shock_grid = np.arange(-SENSITIVITY_SHOCK_RANGE_BP, SENSITIVITY_SHOCK_RANGE_BP + 1, 1)
     values = []
+    linear_values = []
     for shock_bp in shock_grid:
         shocked_value, _ = compute_portfolio_value(df, float(shock_bp), scenario, liquidity_penalty_pct)
         shock_factor = shocked_value / gross_base_value if gross_base_value else 1.0
         values.append(base_nav * shock_factor)
-    return pd.DataFrame({"shock_bp": shock_grid, "implied_nav": values})
+        linear_values.append(base_nav * (1.0 - (weighted_duration * shock_bp / 10000.0)))
+    return pd.DataFrame({"shock_bp": shock_grid, "implied_nav": values, "linear_nav": linear_values})
 
 
 def build_bucket_chart_data(df: pd.DataFrame) -> pd.DataFrame:
@@ -535,12 +563,14 @@ def make_metric_cards(
     ]
     if etf_code == "LQD":
         hedge_specs.append(
-            ("CDX IG hedge", f"${metrics['cdx_ig_hedge_notional']:,.0f} CDX IG notional / $10mm", None)
+            ("CDX IG overlay", f"${metrics['cdx_ig_overlay_notional'] / 1_000_000:.1f}mm / $10mm", None)
         )
     hedge_cols = st.columns(len(hedge_specs))
     for col, (label, value, delta) in zip(hedge_cols, hedge_specs):
         with col:
             st.metric(label, value, delta=delta)
+    if etf_code == "LQD":
+        st.caption("Sized off credit spread DV01, not rates DV01.")
 
     tertiary_specs = [
         ("Weighted bid/ask", f"{metrics['weighted_bid_ask_bps']:.2f} bps", None),
@@ -662,6 +692,15 @@ def plot_sensitivity_curve(curve_df: pd.DataFrame, current_shock_bp: int, curren
             mode="lines",
             line=dict(color=PALETTE[0], width=3),
             name="Implied NAV",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=curve_df["shock_bp"],
+            y=curve_df["linear_nav"],
+            mode="lines",
+            line=dict(color=PALETTE[2], width=2, dash="dash"),
+            name="Duration only (linear)",
         )
     )
     selected_nav = float(curve_df.loc[curve_df["shock_bp"] == current_shock_bp, "implied_nav"].iloc[0])
@@ -914,12 +953,13 @@ def main() -> None:
     settlement_date = APP_DATE
     if compute_duration_from_cashflows:
         holdings_df = apply_cashflow_risk_overrides(holdings_df, settlement_date)
+        holdings_df = apply_etf_specific_fields(holdings_df, selected_etf_code)
 
-    inav_proxy = weighted_average(holdings_df, "clean_price")
+    base_basket_nav = weighted_average(holdings_df, "clean_price")
 
-    data_seed = f"{selected_etf_code}:{data_source_label}:{len(holdings_df)}:{round(inav_proxy, 4)}"
+    data_seed = f"{selected_etf_code}:{data_source_label}:{len(holdings_df)}:{round(base_basket_nav, 4)}"
     if st.session_state.get("_snapshot_seed") != data_seed:
-        st.session_state.last_trade_input = get_default_last_trade(selected_etf_code, inav_proxy)
+        st.session_state.last_trade_input = get_default_last_trade(selected_etf_code, base_basket_nav)
         st.session_state.staleness_seconds = DEFAULT_STALENESS_SECONDS
         st.session_state._snapshot_seed = data_seed
 
@@ -977,16 +1017,24 @@ def main() -> None:
 
     weighted_duration = weighted_average(holdings_df, "duration")
     weighted_convexity = weighted_average(holdings_df, "convexity")
+    weighted_spread_duration = weighted_average(holdings_df, "spread_duration") if "spread_duration" in holdings_df.columns else 0.0
     weighted_bid_ask_bps = weighted_average(holdings_df, "bid_ask_bps")
     weighted_liquidity_score = weighted_average(holdings_df, "liquidity_score")
     top_5_concentration = float(holdings_df.nlargest(5, "weight_pct")["weight_pct"].sum())
+    pricing_detail_df, pricing_waterfall_metrics = build_pricing_waterfall(holdings_df, int(staleness_seconds))
+    inav_proxy = pricing_waterfall_metrics["nav_chosen"]
+    gross_base_value = weighted_nav_from_series(holdings_df, holdings_df["clean_price"])
     dv01_per_100 = inav_proxy * weighted_duration * 0.0001
     dv01_per_10mm = dv01_per_10mm_from_per_100(dv01_per_100)
     ty_hedge_contracts = round(dv01_per_10mm / TY_DV01_PER_BP_USD)
-    cdx_ig_hedge_notional = compute_cdx_ig_hedge_notional(dv01_per_10mm) if selected_etf_code == "LQD" else None
+    credit_dv01_per_10mm = (
+        compute_credit_dv01_per_10mm(inav_proxy, weighted_spread_duration) if selected_etf_code == "LQD" else None
+    )
+    cdx_ig_overlay_notional = (
+        compute_cdx_ig_overlay_notional(credit_dv01_per_10mm) if credit_dv01_per_10mm is not None else None
+    )
     premium_discount_pct = (market_price - inav_proxy) / inav_proxy * 100.0
     premium_discount_bp = premium_discount_pct * 100.0
-    pricing_detail_df, pricing_waterfall_metrics = build_pricing_waterfall(holdings_df, int(staleness_seconds))
     ap_economics = compute_ap_economics(
         holdings_df,
         inav_proxy=inav_proxy,
@@ -1001,7 +1049,7 @@ def main() -> None:
         curve_scenario,
         liquidity_penalty_pct=0.0,
     )
-    current_shocked_nav = inav_proxy * (current_shocked_gross_value / inav_proxy)
+    current_shocked_nav = inav_proxy * (current_shocked_gross_value / gross_base_value) if gross_base_value else current_shocked_gross_value
     nav_move_pct = ((current_shocked_nav - inav_proxy) / inav_proxy * 100.0) if inav_proxy else 0.0
 
     metrics = {
@@ -1010,10 +1058,12 @@ def main() -> None:
         "staleness_seconds": staleness_seconds,
         "weighted_duration": weighted_duration,
         "weighted_convexity": weighted_convexity,
+        "weighted_spread_duration": weighted_spread_duration,
         "dv01_per_100": dv01_per_100,
         "dv01_per_10mm": dv01_per_10mm,
+        "credit_dv01_per_10mm": credit_dv01_per_10mm,
         "ty_hedge_contracts": ty_hedge_contracts,
-        "cdx_ig_hedge_notional": cdx_ig_hedge_notional,
+        "cdx_ig_overlay_notional": cdx_ig_overlay_notional,
         "premium_discount_pct": premium_discount_pct,
         "premium_discount_bp": premium_discount_bp,
         "top_5_concentration": top_5_concentration,
@@ -1062,7 +1112,7 @@ def main() -> None:
                 "\n".join(
                     [
                         "- Basket valuation to approximate iNAV from constituent bond marks.",
-                        "- DV01 and hedge sizing to map ETF risk into TY futures or CDX IG trader units.",
+                        "- DV01 and hedge sizing to map ETF risk into TY futures or a CDX IG credit overlay.",
                         "- Premium/discount monitoring to compare last trade against a live basket proxy rather than a static NAV input.",
                         "- Liquidity and concentration diagnostics to support AP-style execution, hedging and basis discussions.",
                         "- A compact prototype that mirrors how a fixed-income ETF desk frames iNAV, basis and hedge questions intraday.",
@@ -1111,16 +1161,22 @@ def main() -> None:
 
         st.markdown("---")
         st.subheader("Basket pricing detail")
-        nav_cols = st.columns(3)
+        nav_cols = st.columns(4)
         nav_specs = [
             ("iNAV at last trade", pricing_waterfall_metrics["nav_last_trade"], pricing_waterfall_metrics["nav_last_trade_bp"]),
             ("iNAV at evaluated", pricing_waterfall_metrics["nav_evaluated"], pricing_waterfall_metrics["nav_evaluated_bp"]),
             ("iNAV chosen", pricing_waterfall_metrics["nav_chosen"], pricing_waterfall_metrics["nav_chosen_bp"]),
+            ("Basket dispersion (bp)", pricing_waterfall_metrics["basket_dispersion_bp"], None),
         ]
         for col, (label, value, bp_diff) in zip(nav_cols, nav_specs):
             with col:
-                st.metric(label, f"${value:,.2f}", delta=f"{bp_diff:+.2f} bp vs last-trade basket")
-        st.caption("Chosen marks switch from last-trade prints to evaluated marks once basket staleness exceeds 30 seconds.")
+                if label == "Basket dispersion (bp)":
+                    st.metric(label, f"{value:.2f} bp")
+                else:
+                    st.metric(label, f"${value:,.2f}", delta=f"{bp_diff:+.2f} bp vs last-trade basket")
+        st.caption(
+            f"Chosen marks switch from last-trade prints to evaluated marks once basket staleness exceeds {EVALUATED_MARK_SWITCH_SECONDS} seconds."
+        )
         st.dataframe(
             style_pricing_detail_table(pricing_detail_df),
             use_container_width=True,
@@ -1151,17 +1207,24 @@ def main() -> None:
 
     with hedging_tab:
         st.subheader("Hedge construction")
-        hedge_summary_cols = st.columns(4 if selected_etf_code == "LQD" else 3)
+        hedge_summary_cols = st.columns(5 if selected_etf_code == "LQD" else 3)
         hedge_summaries = [
             ("DV01 / $100", f"${dv01_per_100:.3f}"),
             ("DV01 / $10mm", f"${dv01_per_10mm:,.0f}"),
             ("TY hedge", f"{ty_hedge_contracts} contracts"),
         ]
         if selected_etf_code == "LQD":
-            hedge_summaries.append(("CDX IG hedge", f"${cdx_ig_hedge_notional:,.0f} notional"))
+            hedge_summaries.extend(
+                [
+                    ("Spread duration", f"{weighted_spread_duration:.2f} yrs"),
+                    ("CDX IG overlay", f"${cdx_ig_overlay_notional / 1_000_000:.1f}mm"),
+                ]
+            )
         for col, (label, value) in zip(hedge_summary_cols, hedge_summaries):
             with col:
                 st.metric(label, value)
+        if selected_etf_code == "LQD":
+            st.caption("Sized off credit spread DV01, not rates DV01.")
 
         hedge_text_col, hedge_chart_col = st.columns([0.9, 1.1])
         with hedge_text_col:
@@ -1171,7 +1234,7 @@ def main() -> None:
                         "- Parallel-rate DV01 is translated into TY contracts using a $76 per bp desk assumption for the hedge future.",
                         "- The hedge is sized on a $10mm ETF risk unit so the number maps to an AP-style inventory conversation.",
                         "- TY neutralises first-order rates risk; residual P&L remains in curve shape, credit basis and mark quality.",
-                        "- For LQD, CDX IG gives a separate credit hedge anchor alongside the rates hedge.",
+                        "- For LQD, the CDX IG overlay is sized off spread DV01 using a simple spread-duration factor.",
                     ]
                 )
             )
@@ -1186,14 +1249,44 @@ def main() -> None:
 
     with method_tab:
         st.subheader("Method")
+        st.markdown("### iNAV")
+        st.latex(r"\mathrm{iNAV} = \sum_i w_i \cdot P_i^{\mathrm{chosen}}")
+        st.latex(
+            rf"P_i^{{\mathrm{{chosen}}}} = \begin{{cases}} P_i^{{\mathrm{{last}}}}, & \text{{if staleness}} < {EVALUATED_MARK_SWITCH_SECONDS}\text{{s}} \\ P_i^{{\mathrm{{eval}}}}, & \text{{otherwise}} \end{{cases}}"
+        )
+        st.caption("The headline basket mark uses last-trade bond prices until the basket is treated as stale, then flips to evaluated marks.")
+
+        st.markdown("### Cashflow pricing")
+        st.latex(r"P(y) = \sum_{t=1}^{T} \frac{CF_t}{\left(1 + \frac{y}{m}\right)^{m \tau_t}}")
+        st.latex(r"D_{\mathrm{mod}} \approx -\frac{P(y+\Delta y) - P(y-\Delta y)}{2 P(y)\Delta y}")
+        st.latex(r"C \approx \frac{P(y-\Delta y) + P(y+\Delta y) - 2P(y)}{P(y)(\Delta y)^2}")
+        st.caption("For Treasury holdings, duration and convexity can be recomputed from coupon cashflows using a numerical ±1 bp reprice.")
+
+        st.markdown("### Duration-Convexity Reprice")
+        st.latex(r"\frac{\Delta P}{P} \approx -D \cdot \Delta y + \frac{1}{2} C \cdot (\Delta y)^2")
+        st.caption("Scenario NAV applies the duration-convexity approximation bond by bond, then aggregates back to the ETF level.")
+
+        st.markdown("### AP Economics")
+        st.latex(r"\mathrm{create\_cost}_{bp} = \left(\frac{\mathrm{NAV}_{offer}}{\mathrm{iNAV}} - 1\right)\times 10{,}000 + \mathrm{financing}_{bp} + \mathrm{cross}_{bp}")
+        st.latex(r"\mathrm{redeem\_cost}_{bp} = \left(1 - \frac{\mathrm{NAV}_{bid}}{\mathrm{iNAV}}\right)\times 10{,}000 + \mathrm{financing}_{bp} + \mathrm{cross}_{bp}")
+        st.latex(r"\mathrm{create\_arb}_{bp} = \mathrm{P/D}_{bp} - \mathrm{create\_cost}_{bp}")
+        st.latex(r"\mathrm{redeem\_arb}_{bp} = -\mathrm{P/D}_{bp} - \mathrm{redeem\_cost}_{bp}")
+        st.caption("Positive create arb means the ETF is rich enough to create and sell; positive redeem arb means it is cheap enough to buy and redeem.")
+
+        st.markdown("### Hedging")
+        st.latex(r"N_{\mathrm{TY}} = \mathrm{round}\left(\frac{\mathrm{DV01}^{rates}_{portfolio}}{\mathrm{DV01}_{TY}}\right)")
+        st.latex(r"D_{spread} = 0.95 \times D_{rates}")
+        st.latex(r"\mathrm{DV01}^{credit}_{portfolio} = \mathrm{iNAV} \cdot D_{spread} \cdot 10^{-4} \cdot \frac{10{,}000{,}000}{100}")
+        st.latex(r"\mathrm{CDX\ overlay\ notional} = \frac{\mathrm{DV01}^{credit}_{portfolio}}{\mathrm{DV01}_{CDX\ IG}} \times 10{,}000{,}000")
+        st.caption("The TY leg neutralises parallel rates DV01, while the CDX IG overlay is a separate credit-risk anchor for LQD-style baskets.")
+
+        st.markdown("### References")
         st.markdown(
             "\n".join(
                 [
-                    "- `iNAV proxy`: weighted clean-price basket mark built from the uploaded or bundled holdings file.",
-                    "- `Cashflow pricing`: when enabled, Treasury duration and convexity are recomputed from coupon cashflows and YTM using a ±1 bp numerical bump.",
-                    "- `Sensitivity`: shocked basket prices use duration-convexity repricing under parallel moves plus optional curve steepener/flattener overlays.",
-                    "- `AP economics`: create/redeem logic applies half-spread basket costs plus financing and crossing assumptions to judge whether the basis clears frictions.",
-                    "- `Hedging`: ETF DV01 is translated into TY futures and, for LQD, CDX IG notional to mirror trader sizing language.",
+                    "1. Kevin Pan and Yao Zeng, *ETF Arbitrage under Liquidity Mismatch* (working paper widely cited in 2022 bond ETF/AP discussions).",
+                    "2. Ananth Madhavan and Aleksander Sobczyk, *Price Dynamics and Liquidity of Exchange-Traded Funds*.",
+                    "3. Vladyslav Sushko and Grant Turner, *The Implications of Passive Investing for Securities Markets*, BIS Quarterly Review, March 2018.",
                 ]
             )
         )
