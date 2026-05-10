@@ -48,8 +48,9 @@ CURVE_TWISTS = {
 
 PALETTE = ["#0F4C81", "#1D6F42", "#556B8E", "#8AA1B1", "#B08968"]
 DISCLAIMER = (
-    "This is an educational approximation of fixed-income ETF basket analytics, not a production pricing model. "
-    "It uses sample/synthetic holdings and simplified duration-convexity pricing."
+    "This is an educational approximation of fixed-income ETF basket analytics. "
+    "It uses synthetic holdings and simplified duration-convexity pricing. "
+    "It is not intended to produce tradable prices, investment advice or production-grade ETF valuations."
 )
 
 
