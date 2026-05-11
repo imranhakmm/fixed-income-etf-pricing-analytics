@@ -119,7 +119,10 @@ def inject_css() -> None:
             --plot-reference: rgba(112, 128, 144, 0.9);
         }
 
-        .stApp[data-theme="dark"] {
+        html[data-theme="dark"],
+        body[data-theme="dark"],
+        .stApp[data-theme="dark"],
+        [data-testid="stAppViewContainer"][data-theme="dark"] {
             --bg-base: #0F1B2E;
             --bg-surface: #1A2740;
             --bg-sidebar: #14213D;
@@ -139,7 +142,7 @@ def inject_css() -> None:
         }
 
         @media (prefers-color-scheme: dark) {
-            :root {
+            :root:not([data-theme="light"]) {
                 --bg-base: #0F1B2E;
                 --bg-surface: #1A2740;
                 --bg-sidebar: #14213D;
@@ -159,7 +162,10 @@ def inject_css() -> None:
             }
         }
 
-        .stApp[data-theme="light"] {
+        html[data-theme="light"],
+        body[data-theme="light"],
+        .stApp[data-theme="light"],
+        [data-testid="stAppViewContainer"][data-theme="light"] {
             --bg-base: #FFFFFF;
             --bg-surface: #FFFFFF;
             --bg-sidebar: #F6F8FB;
