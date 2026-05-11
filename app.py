@@ -141,27 +141,6 @@ def inject_css() -> None:
             --plot-reference: rgba(155, 170, 206, 0.8);
         }
 
-        @media (prefers-color-scheme: dark) {
-            :root:not([data-theme="light"]) {
-                --bg-base: #0F1B2E;
-                --bg-surface: #1A2740;
-                --bg-sidebar: #14213D;
-                --border: #2A3A5C;
-                --text-primary: #E6EDF7;
-                --text-secondary: #9BAACE;
-                --accent: #3D7AB8;
-                --shadow: rgba(0, 0, 0, 0.22);
-                --inline-code-bg: rgba(230, 237, 247, 0.08);
-                --inline-code-text: #E6EDF7;
-                --danger: #F28B82;
-                --success: #7CD992;
-                --alert-bg: var(--bg-surface);
-                --tab-active: var(--accent);
-                --plot-grid: rgba(155, 170, 206, 0.22);
-                --plot-reference: rgba(155, 170, 206, 0.8);
-            }
-        }
-
         html[data-theme="light"],
         body[data-theme="light"],
         .stApp[data-theme="light"],
