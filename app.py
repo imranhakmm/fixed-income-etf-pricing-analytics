@@ -159,6 +159,25 @@ def inject_css() -> None:
             }
         }
 
+        .stApp[data-theme="light"] {
+            --bg-base: #FFFFFF;
+            --bg-surface: #FFFFFF;
+            --bg-sidebar: #F6F8FB;
+            --border: #D8E0E8;
+            --text-primary: #102A43;
+            --text-secondary: #52606D;
+            --accent: #0F4C81;
+            --shadow: rgba(15, 23, 42, 0.04);
+            --inline-code-bg: rgba(15, 23, 42, 0.06);
+            --inline-code-text: #0F172A;
+            --danger: #9B2C2C;
+            --success: #1D6F42;
+            --alert-bg: #EAF2FF;
+            --tab-active: var(--accent);
+            --plot-grid: rgba(148, 163, 184, 0.32);
+            --plot-reference: rgba(112, 128, 144, 0.9);
+        }
+
         html, body, .stApp, [data-testid="stAppViewContainer"], [data-testid="stSidebar"] {
             font-family: var(--app-font-sans);
             color: var(--text-primary);
