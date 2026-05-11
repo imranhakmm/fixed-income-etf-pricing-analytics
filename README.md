@@ -1,12 +1,25 @@
 # Fixed Income ETF Fair Value & Basket Analytics Tool
 
+Desk-style Streamlit prototype for ETF fair value, iNAV monitoring, AP economics, and hedge diagnostics across Treasury and IG credit baskets.
+
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/) [![Streamlit](https://img.shields.io/badge/Streamlit-app-red.svg)](https://fixed-income-etf-pricing-analytics-tool.streamlit.app/) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+## Links
+
+- Live app: https://fixed-income-etf-pricing-analytics-tool.streamlit.app/
+- GitHub: https://github.com/imranhakmm/fixed-income-etf-pricing-analytics
+
+## Dashboard preview
+
+![Dashboard preview](assets/dashboard_preview.png)
+
 ## Overview
 
 This project is a Streamlit dashboard for analysing the fair value, rate sensitivity, liquidity profile and basket composition of a fixed-income ETF.
 
 The purpose of this project is not to build a production-grade ETF pricing engine. It is to demonstrate the core analytical workflow behind fixed-income ETF basket valuation: aggregating constituent-level bond data, estimating rate sensitivity, comparing estimated fair value to market price, and diagnosing liquidity/concentration risks.
 
-The app includes two realistic illustrative baskets: an IEF-style intermediate Treasury basket and an LQD-style investment-grade credit basket. The holdings are manually curated rather than sourced live from issuer files, but the shapes, weights, maturities, spreads and risk measures are designed to look like the kind of basket inputs a trading analyst would inspect intraday.
+The app includes two realistic illustrative baskets: an IEF-style intermediate Treasury basket and an LQD-style investment-grade credit basket. The holdings are illustrative baskets constructed to match the shape of real iShares PCF data rather than sourced live from issuer files.
 
 ## Why I built this
 
@@ -142,6 +155,7 @@ This does not claim to be an executable AP model. It is a desk-style sanity chec
 This project intentionally uses a simplified model. The main assumptions are:
 
 - Holdings are realistic illustrative baskets rather than live issuer PCF files.
+- Holdings are illustrative; the schema matches iShares PCF format so live PCF data can be dropped in with no code changes.
 - Clean prices are treated as representative of bond fair value.
 - Basket weights are fixed.
 - Treasury duration and convexity can be recomputed from cashflows; otherwise they are treated as inputs.

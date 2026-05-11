@@ -24,7 +24,7 @@ ETF_LABEL_MAP = {
     "LQD (IG Credit)": "LQD",
 }
 ETF_DEFAULT_PD_BP = {
-    "IEF": 4.0,
+    "IEF": 3.0,
     "LQD": 18.0,
 }
 DEFAULT_STALENESS_SECONDS = 15
@@ -80,9 +80,7 @@ CURVE_TWISTS = {
 
 PALETTE = ["#0F4C81", "#1D6F42", "#556B8E", "#8AA1B1", "#B08968"]
 DISCLAIMER = (
-    "This is an educational approximation of fixed-income ETF basket analytics and iNAV monitoring. "
-    "It uses realistic illustrative baskets, simplified AP economics, and duration-convexity pricing. "
-    "It is not intended to replace issuer iNAV, executable AP cost models, or production-grade ETF valuations."
+    "Educational prototype using illustrative ETF baskets, simplified AP economics and duration-convexity pricing."
 )
 
 
@@ -451,7 +449,7 @@ def build_pricing_waterfall(df: pd.DataFrame, staleness_seconds: int) -> tuple[p
     nav_last_trade = weighted_nav_from_series(pricing_df, pricing_df["last_trade_price"])
     nav_evaluated = weighted_nav_from_series(pricing_df, pricing_df["evaluated_price"])
     nav_chosen = weighted_nav_from_series(pricing_df, pricing_df["chosen_price"])
-    chosen_deltas_bp = ((pricing_df["chosen_price"] - pricing_df["last_trade_price"]) / pricing_df["last_trade_price"]) * 10000.0
+    evaluated_deltas_bp = ((pricing_df["evaluated_price"] - pricing_df["last_trade_price"]) / pricing_df["last_trade_price"]) * 10000.0
     return pricing_df, {
         "nav_last_trade": nav_last_trade,
         "nav_evaluated": nav_evaluated,
@@ -459,7 +457,7 @@ def build_pricing_waterfall(df: pd.DataFrame, staleness_seconds: int) -> tuple[p
         "nav_last_trade_bp": 0.0,
         "nav_evaluated_bp": (nav_evaluated / nav_last_trade - 1.0) * 10000.0,
         "nav_chosen_bp": (nav_chosen / nav_last_trade - 1.0) * 10000.0,
-        "basket_dispersion_bp": float(chosen_deltas_bp.std(ddof=0)),
+        "basket_dispersion_bp": float(evaluated_deltas_bp.std(ddof=0)),
         "stale_factor": stale_factor,
     }
 
@@ -1050,7 +1048,8 @@ def main() -> None:
     curve_scenario = st.sidebar.selectbox(
         "Steepener / flattener shock",
         options=list(CURVE_TWISTS.keys()),
-        index=0,
+        index=list(CURVE_TWISTS.keys()).index("None"),
+        key="curve_scenario",
     )
     st.sidebar.markdown("### AP assumptions")
     financing_bp = st.sidebar.number_input(
@@ -1229,6 +1228,7 @@ def main() -> None:
                     st.metric(label, f"{value:.2f} bp")
                 else:
                     st.metric(label, f"${value:,.2f}", delta=f"{bp_diff:+.2f} bp vs last-trade basket")
+        st.caption("Cross-sectional stdev of evaluated marks vs last-trade across the basket.")
         st.caption(
             f"Chosen marks switch from last-trade prints to evaluated marks once basket staleness exceeds {EVALUATED_MARK_SWITCH_SECONDS} seconds."
         )
@@ -1345,8 +1345,8 @@ def main() -> None:
                 ]
             )
         )
-        st.caption(
-            "The app is designed as a transparent prototype: realistic illustrative baskets, desk-style units, and explicit market-friction assumptions rather than opaque model complexity."
+        st.markdown(
+            "This is not a production ETF pricing engine. It uses illustrative holdings, simplified AP economics and duration-convexity pricing rather than full cashflow discounting against a fitted curve. It is not intended to replace issuer iNAV, executable AP cost models, or production-grade ETF valuations."
         )
 
 
