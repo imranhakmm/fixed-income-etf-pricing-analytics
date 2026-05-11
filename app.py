@@ -84,6 +84,14 @@ DISCLAIMER = (
 )
 
 
+def get_plotly_template() -> str:
+    """Return plotly template matching Streamlit theme base."""
+    try:
+        return "plotly_dark" if st.get_option("theme.base") == "dark" else "plotly_white"
+    except Exception:
+        return "plotly_white"
+
+
 def inject_css() -> None:
     st.markdown(
         """
@@ -93,10 +101,71 @@ def inject_css() -> None:
         :root {
             --app-font-sans: 'Inter', sans-serif;
             --app-font-mono: 'JetBrains Mono', monospace;
+            --bg-base: #FFFFFF;
+            --bg-surface: #FFFFFF;
+            --bg-sidebar: #F6F8FB;
+            --border: #D8E0E8;
+            --text-primary: #102A43;
+            --text-secondary: #52606D;
+            --accent: #0F4C81;
+            --shadow: rgba(15, 23, 42, 0.04);
+            --inline-code-bg: rgba(15, 23, 42, 0.06);
+            --inline-code-text: #0F172A;
+            --danger: #9B2C2C;
+            --success: #1D6F42;
+            --alert-bg: #EAF2FF;
+            --tab-active: var(--accent);
+            --plot-grid: rgba(148, 163, 184, 0.32);
+            --plot-reference: rgba(112, 128, 144, 0.9);
+        }
+
+        .stApp[data-theme="dark"] {
+            --bg-base: #0F1B2E;
+            --bg-surface: #1A2740;
+            --bg-sidebar: #14213D;
+            --border: #2A3A5C;
+            --text-primary: #E6EDF7;
+            --text-secondary: #9BAACE;
+            --accent: #3D7AB8;
+            --shadow: rgba(0, 0, 0, 0.22);
+            --inline-code-bg: rgba(230, 237, 247, 0.08);
+            --inline-code-text: #E6EDF7;
+            --danger: #F28B82;
+            --success: #7CD992;
+            --alert-bg: var(--bg-surface);
+            --tab-active: var(--accent);
+            --plot-grid: rgba(155, 170, 206, 0.22);
+            --plot-reference: rgba(155, 170, 206, 0.8);
+        }
+
+        @media (prefers-color-scheme: dark) {
+            :root {
+                --bg-base: #0F1B2E;
+                --bg-surface: #1A2740;
+                --bg-sidebar: #14213D;
+                --border: #2A3A5C;
+                --text-primary: #E6EDF7;
+                --text-secondary: #9BAACE;
+                --accent: #3D7AB8;
+                --shadow: rgba(0, 0, 0, 0.22);
+                --inline-code-bg: rgba(230, 237, 247, 0.08);
+                --inline-code-text: #E6EDF7;
+                --danger: #F28B82;
+                --success: #7CD992;
+                --alert-bg: var(--bg-surface);
+                --tab-active: var(--accent);
+                --plot-grid: rgba(155, 170, 206, 0.22);
+                --plot-reference: rgba(155, 170, 206, 0.8);
+            }
         }
 
         html, body, .stApp, [data-testid="stAppViewContainer"], [data-testid="stSidebar"] {
             font-family: var(--app-font-sans);
+            color: var(--text-primary);
+        }
+
+        .stApp, [data-testid="stAppViewContainer"] {
+            background: var(--bg-base);
         }
 
         .block-container {
@@ -105,9 +174,9 @@ def inject_css() -> None:
             max-width: 1400px;
         }
         [data-testid="stSidebar"] {
-            background: #F6F8FB;
-            color: #102A43;
-            border-right: 1px solid #D8E0E8;
+            background: var(--bg-sidebar);
+            color: var(--text-primary);
+            border-right: 1px solid var(--border);
         }
         [data-testid="stSidebar"] h1,
         [data-testid="stSidebar"] h2,
@@ -122,7 +191,7 @@ def inject_css() -> None:
         [data-testid="stSidebar"] .stCaption,
         [data-testid="stSidebar"] .stMarkdown,
         [data-testid="stSidebar"] .stMarkdown * {
-            color: #102A43 !important;
+            color: var(--text-primary) !important;
         }
         [data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"],
         [data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"] *,
@@ -130,33 +199,64 @@ def inject_css() -> None:
         [data-testid="stSidebar"] [data-baseweb="select"] > div,
         [data-testid="stSidebar"] input,
         [data-testid="stSidebar"] textarea {
-            background-color: #FFFFFF !important;
-            color: #102A43 !important;
-            border-color: #D8E0E8 !important;
+            background-color: var(--bg-surface) !important;
+            color: var(--text-primary) !important;
+            border-color: var(--border) !important;
         }
         [data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"] * {
             opacity: 1 !important;
         }
+        [data-testid="stSidebar"] [data-baseweb="select"] svg,
+        [data-testid="stSidebar"] svg {
+            color: var(--text-secondary) !important;
+            fill: var(--text-secondary) !important;
+        }
+        .stApp h1, .stApp h2, .stApp h3, .stApp h4, .stApp h5, .stApp h6,
+        .stApp p, .stApp li, .stApp label, .stApp span, .stApp div, .stApp small {
+            color: var(--text-primary);
+        }
         [data-testid="stMetric"] {
-            background: #FFFFFF;
-            border: 1px solid #D8E0E8;
-            border-radius: 14px;
-            padding: 0.9rem 1rem;
-            box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+            background: var(--bg-surface);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 0.55rem 0.75rem;
+            min-width: 150px;
+            box-shadow: 0 1px 2px var(--shadow);
         }
         [data-testid="stMetricValue"] {
-            color: #102A43;
+            color: var(--text-primary);
             font-family: var(--app-font-mono);
             font-weight: 600;
             letter-spacing: -0.03em;
+            font-size: 1.4rem;
+            white-space: nowrap;
+            overflow: visible;
+            text-overflow: clip;
         }
         [data-testid="stMetricLabel"] {
-            color: #52606D;
+            color: var(--text-secondary);
             font-size: 0.88rem;
             font-family: var(--app-font-sans);
         }
         [data-testid="stMetricDelta"] {
             font-family: var(--app-font-mono);
+        }
+        [data-testid="stAlert"] {
+            background: var(--alert-bg);
+            color: var(--text-primary);
+            border: 1px solid var(--border);
+            border-left: 3px solid var(--accent);
+        }
+        [data-testid="stAlert"] * {
+            color: var(--text-primary) !important;
+        }
+        button[role="tab"] {
+            color: var(--text-secondary) !important;
+        }
+        button[role="tab"][aria-selected="true"] {
+            color: var(--text-primary) !important;
+            border-bottom-color: var(--tab-active) !important;
+            box-shadow: inset 0 -2px 0 var(--tab-active);
         }
         h1, h2, h3, h4, h5, h6, p, li, label, span, div, button, input, textarea, select, small {
             font-family: var(--app-font-sans);
@@ -167,8 +267,8 @@ def inject_css() -> None:
         }
         .stMarkdown code {
             font-family: var(--app-font-mono) !important;
-            background: rgba(15, 23, 42, 0.06);
-            color: #0F172A;
+            background: var(--inline-code-bg);
+            color: var(--inline-code-text);
             border-radius: 6px;
             padding: 0.08rem 0.34rem;
         }
@@ -177,24 +277,24 @@ def inject_css() -> None:
             padding: 0;
         }
         .subtle-note {
-            color: #52606D;
+            color: var(--text-secondary);
             font-size: 0.95rem;
             line-height: 1.4;
         }
         .stale-caption {
             margin-top: 0.15rem;
-            color: #9B2C2C;
+            color: var(--danger);
             font-size: 0.8rem;
             line-height: 1.2;
         }
         .signal-card {
-            border-radius: 14px;
-            border: 1px solid #D8E0E8;
+            border-radius: 10px;
+            border: 1px solid var(--border);
             padding: 0.9rem 1rem;
-            background: #FFFFFF;
+            background: var(--bg-surface);
         }
         .signal-card__label {
-            color: #52606D;
+            color: var(--text-secondary);
             font-size: 0.88rem;
             margin-bottom: 0.35rem;
         }
@@ -202,45 +302,51 @@ def inject_css() -> None:
             font-family: var(--app-font-mono);
             font-size: 1.75rem;
             font-weight: 600;
-            color: #102A43;
+            color: var(--text-primary);
         }
         .signal-positive .signal-card__value {
-            color: #1D6F42;
+            color: var(--success);
         }
         .signal-negative .signal-card__value {
-            color: #9B2C2C;
+            color: var(--danger);
         }
         .compact-metric-card {
-            border-radius: 14px;
-            border: 1px solid #D8E0E8;
-            padding: 0.9rem 1rem;
-            background: #FFFFFF;
-            box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
-            min-height: 128px;
+            border-radius: 10px;
+            border: 1px solid var(--border);
+            padding: 0.55rem 0.75rem;
+            background: var(--bg-surface);
+            box-shadow: 0 1px 2px var(--shadow);
+            min-height: 104px;
+            min-width: 150px;
         }
         .compact-metric-label {
-            color: #52606D;
+            color: var(--text-secondary);
             font-size: 0.88rem;
-            margin-bottom: 0.35rem;
+            margin-bottom: 0.2rem;
         }
         .compact-metric-value {
             font-family: var(--app-font-mono);
-            font-size: 1.45rem;
+            font-size: 1.18rem;
             font-weight: 700;
             line-height: 1.12;
-            white-space: normal;
-            overflow-wrap: anywhere;
-            color: #102A43;
+            white-space: nowrap;
+            overflow: visible;
+            text-overflow: clip;
+            color: var(--text-primary);
+            display: inline;
         }
         .compact-metric-secondary {
             font-family: var(--app-font-mono);
-            font-size: 1.02rem;
+            font-size: 1.0rem;
             font-weight: 600;
             line-height: 1.12;
-            white-space: normal;
-            overflow-wrap: anywhere;
-            color: #52606D;
-            margin-top: 0.35rem;
+            white-space: nowrap;
+            overflow: visible;
+            text-overflow: clip;
+            color: var(--text-secondary);
+            margin-top: 0;
+            margin-left: 0.32rem;
+            display: inline;
         }
         </style>
         """,
@@ -686,7 +792,7 @@ def plot_bucket_exposure(bucket_df: pd.DataFrame) -> go.Figure:
     )
     fig.update_traces(texttemplate="%{text:.1f}%", textposition="outside", cliponaxis=False)
     fig.update_layout(
-        template="plotly_white",
+        template=get_plotly_template(),
         title="Maturity Bucket Exposure",
         xaxis_title="Remaining maturity bucket",
         yaxis_title="Weight (%)",
@@ -709,7 +815,7 @@ def plot_top_holdings(top_holdings: pd.DataFrame) -> go.Figure:
     )
     fig.update_traces(texttemplate="%{text:.1f}%", textposition="outside", cliponaxis=False)
     fig.update_layout(
-        template="plotly_white",
+        template=get_plotly_template(),
         title="Top Holdings by Weight",
         xaxis_title="Weight (%)",
         yaxis_title="Holding",
@@ -746,14 +852,14 @@ def plot_sensitivity_curve(curve_df: pd.DataFrame, current_shock_bp: int, curren
             x=[current_shock_bp],
             y=[selected_nav],
             mode="markers",
-            marker=dict(size=11, color=PALETTE[1], line=dict(color="white", width=1.5)),
+            marker=dict(size=11, color=PALETTE[1], line=dict(color="rgba(255,255,255,0.92)", width=1.5)),
             name="Selected shock",
         )
     )
-    fig.add_vline(x=current_shock_bp, line_width=1, line_dash="dash", line_color="#708090")
-    fig.add_hline(y=current_nav, line_width=1, line_dash="dot", line_color="#A0AEC0")
+    fig.add_vline(x=current_shock_bp, line_width=1, line_dash="dash", line_color="rgba(112, 128, 144, 0.85)")
+    fig.add_hline(y=current_nav, line_width=1, line_dash="dot", line_color="rgba(160, 174, 192, 0.9)")
     fig.update_layout(
-        template="plotly_white",
+        template=get_plotly_template(),
         title="NAV Sensitivity Under Parallel Shocks",
         xaxis_title="Parallel shock (bp)",
         yaxis_title="Implied NAV",
@@ -780,7 +886,7 @@ def plot_pd_history(history_df: pd.DataFrame) -> go.Figure:
             x=history_df["date"],
             y=history_df["upper_band_bp"],
             mode="lines",
-            line=dict(color="#94A3B8", width=1, dash="dash"),
+            line=dict(color="rgba(148, 163, 184, 0.9)", width=1, dash="dash"),
             name="+2σ band",
         )
     )
@@ -789,7 +895,7 @@ def plot_pd_history(history_df: pd.DataFrame) -> go.Figure:
             x=history_df["date"],
             y=history_df["lower_band_bp"],
             mode="lines",
-            line=dict(color="#94A3B8", width=1, dash="dash"),
+            line=dict(color="rgba(148, 163, 184, 0.9)", width=1, dash="dash"),
             fill="tonexty",
             fillcolor="rgba(148, 163, 184, 0.14)",
             name="-2σ band",
@@ -805,13 +911,15 @@ def plot_pd_history(history_df: pd.DataFrame) -> go.Figure:
         )
     )
     fig.update_layout(
-        template="plotly_white",
+        template=get_plotly_template(),
         title="Premium / Discount History",
         xaxis_title="Date",
         yaxis_title="P/D (bp)",
         margin=dict(l=10, r=10, t=50, b=10),
         height=320,
         legend_title_text="",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
     )
     return fig
 
@@ -837,7 +945,7 @@ def plot_duration_yield_scatter(df: pd.DataFrame) -> go.Figure:
         category_orders={"bucket": BUCKET_ORDER},
     )
     fig.update_layout(
-        template="plotly_white",
+        template=get_plotly_template(),
         title="Duration vs. Yield",
         xaxis_title="Yield (%)",
         yaxis_title="Duration (yrs)",
@@ -859,7 +967,7 @@ def plot_dv01_contributors(contributors_df: pd.DataFrame) -> go.Figure:
     )
     fig.update_traces(texttemplate="$%{text:,.0f}", textposition="outside", cliponaxis=False)
     fig.update_layout(
-        template="plotly_white",
+        template=get_plotly_template(),
         title="Top DV01 Contributors",
         xaxis_title="DV01 per $10mm",
         yaxis_title="Holding",
